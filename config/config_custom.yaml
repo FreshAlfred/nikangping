@@ -195,20 +195,21 @@ walk_teleport:
 # 多角色 / 模式：启动空闲；F1 / F2 / F3 加载对应配置并开始（再按同键关闭）
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# 测谎 / 谎言探测仪（笔记本分支：仅报警，不跟形）
-#   - 模板一命中立刻响铃并暂停挂机（不等人手/OCR）
-#   - auto_follow=false：不吸鼠、不加载 YOLO/跟形模型
+# 测谎 / 谎言探测仪（对标 gostart 高级模式：提醒 + 热力图跟形）
+#   - 模板一命中立刻响铃并暂停挂机——「小游戏出现提醒」
+#   - auto_follow=true：确认开局白形后才移鼠；热力图 + 白形/YOLO 回退
 # ---------------------------------------------------------------------------
 lie_alert:
   enable: true
   template: "assets/lie_detector/lie.png"
+  sensitivity: 50                # 0–100；越高越易命中（对标 gostart 灵敏度）
   match_threshold: 0.14          # EN 标题；SQDIFF 越小越像（勿再放宽到 0.22）
   cn_title_match_threshold: 0.030 # 中文标题必须几乎完美；手机裁图易误报
-  cn_title_require_ocr: false    # 笔记本：不要等 OCR，模板命中立刻报警
+  cn_title_require_ocr: false    # 不要等 OCR，模板命中立刻报警
   check_interval_frames: 1       # 每帧检模板，弹窗出现当帧就能报警
   alert_cooldown_s: 3.0
   freeze_seconds: 8.0
-  hold_seconds: 25.0             # 仅粘住暂停挂机；无跟形不必拉到 50s
+  hold_seconds: 50.0             # 跟形会话粘滞
   rearm_cooldown_s: 8.0          # 会话超时后冷却，避免立刻再误报循环
   center_roi_ratio: 0.90
   templates:
@@ -234,8 +235,15 @@ lie_alert:
     - "逐渐透明且移动"
     - "LIE DETECTOR"
     - "Lie Detector"
-  # 笔记本：关掉跟形（鼠标/YOLO/白形跟踪全部不跑）
-  auto_follow: false
+  auto_follow: true
+  # gostart 式热力图跟形（自有 lie_heatmap.onnx，非 gostart 权重）
+  heatmap_enable: true
+  heatmap_model: "assets/lie_detector/lie_heatmap.onnx"
+  opening_confirm_frames: 4      # 连续白形命中后才首次移鼠
+  opening_confirm_timeout_s: 8.0 # 超时后仍武装，改走热力图/经典回退
+  control_min_confidence: 0.42   # fail-closed：低于此不移鼠
+  heatmap_ambiguity_secondary_ratio: 0.78
+  predict_coast_s: 0.30          # 短时预测跟（光标）；内部 RED 仍可用 lose_target_grace
   record_clip: false
   record_dir: "_debug_out/lie_clips"
   record_fps: 30
@@ -246,12 +254,12 @@ lie_alert:
   record_postroll_s: 0
   record_max_s: 120
   record_draw_track: false
-  dialog_miss_limit: 3           # 无跟形：漏检几次就结束粘滞，尽快恢复挂机
-  dialog_min_session_s: 5.0      # 无跟形：不必硬撑 40s
+  dialog_miss_limit: 5
+  dialog_min_session_s: 20.0
   mouse_takeover_px: 40
   mouse_move_grace_s: 0.08
   white_miss_grace_s: 0.45
-  follow_start_delay_s: 0.0      # 跟形已关；保留项不影响报警
+  follow_start_delay_s: 0.5
   follow_timeout_s: 60.0
   follow_interval_frames: 1
   shapes_dir: "assets/lie_detector/shapes"
@@ -288,7 +296,7 @@ lie_alert:
   motion_weight: 0.35
   template_weight: 0.50
   mouse_smooth: 0.92                # 跟形更贴目标；大跳变代码里会硬吸
-  lose_target_grace_s: 2.0
+  lose_target_grace_s: 1.2          # 内部轨迹宽限；光标预测用 predict_coast_s
   # 只拦开场倒计时；follow_ready 后不再跑 OCR 门控（会卡主线程导致晚吸鼠）
   # 不要写「移动鼠标/放置在」——常驻说明条会整场误拦
   intro_ocr_block_keywords:
@@ -298,6 +306,30 @@ lie_alert:
     - "测谎小游戏开始"
     - "请前往安全地点"
 
+# ---------------------------------------------------------------------------
+# 掉线提醒（对标 gostart「掉线提醒」）：丢窗 / 登录选角界面 → 响铃停挂机
+# ---------------------------------------------------------------------------
+disconnect_alert:
+  enable: true
+  sensitivity: 50                # 0–100；越高模板越易命中
+  check_interval_frames: 8
+  miss_frames: 45                # 连续丢帧约 2s@25fps 才报
+  hold_seconds: 20.0
+  freeze_seconds: 8.0
+  alert_cooldown_s: 8.0
+  match_threshold: 0.14
+  templates_dir: "assets/disconnect"
+  templates: []                  # 可选：再列具体 png；空则扫 templates_dir
+  ocr_enable: true
+  ocr_min_interval_s: 6.0
+  ocr_keywords:
+    - "重新登录"
+    - "请重新登录"
+    - "选择角色"
+    - "频道选择"
+    - "与服务器断开"
+    - "连接中断"
+    - "登录器"
 
 profiles:
   f1:
@@ -328,10 +360,10 @@ profiles:
     monster_detect:
       enable: false
     buff_skill:
-      keys: ["w", "shift", "end"]
-      cooldown: [120, 300, 1500]       # 2分 / 5分 / 25分
-      wait_before_combat: true
-      freeze_seconds: 2.5             # F1 放 buff 时停住移动/攻击，避免打断
+      keys: []                         # F1 不施放 buff
+      cooldown: []
+      wait_before_combat: false        # 开挂即巡逻攻击，不等 buff
+      freeze_seconds: 2.5
       action_cooldown: 1.5
     pet_feed:
       enable: false

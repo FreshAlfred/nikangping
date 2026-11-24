@@ -15,14 +15,15 @@
   - 默认自动录像：触发前约 2 秒 + 整段测谎 → _debug_out/lie_clips/lie_时间戳.mp4
     关闭：lie_alert.record_clip: false
 
-鼠标跟随（lie_alert.auto_follow）——图形随机：
-  目标是「相对周围明显更亮的白色几何块」（星/心/菱形…），会移动并渐隐。
-  策略（防跟错）：
-    1) 说明文字/倒计时还在时先不跟
-    2) 用局部对比度找白色目标，丢掉岩石高光、HUD、大号倒计时
-    3) 锁定后只在附近小范围搜索，禁止远距离跳到别的亮块
-    4) shapes/ 模板仅在相关度很高时才用
-  调试窗：红圈 + 绿十字。
+鼠标跟随（lie_alert.auto_follow）——对标 gostart 高级模式：
+  1) 弹窗/intro 结束
+  2) 连续确认开局白形（opening_confirm_frames）后才首次移鼠
+  3) 热力图因果跟踪（lie_heatmap.onnx，自有权重）+ 白形/YOLO 回退
+  4) fail-closed：低置信 / 多峰歧义不移鼠；短时预测用 predict_coast_s
+  调试窗：红圈 = 当前跟踪中心
+
+热力图模型：
+  assets/lie_detector/lie_heatmap.onnx   # 缺失时会自动导出启发式头
 
 补充其它图形模板（可选，更稳）：
   1. 小游戏里截一张清晰实心白图
@@ -31,5 +32,12 @@
 
 关闭跟随（只响铃）：
   lie_alert.auto_follow: false
+
+灵敏度（对标 gostart「小游戏出现提醒」）：
+  lie_alert.sensitivity: 50   # 0–100；越高越易命中
+
+掉线提醒见：
+  assets/disconnect/README.txt
+  config → disconnect_alert
 
 注意：跟随会移动系统鼠标；测谎时请勿同时手动抢鼠标。

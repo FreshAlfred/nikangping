@@ -29,6 +29,7 @@ from src.utils.common import (
 )
 from src.input.GameWindowCapturor import GameWindowCapturor
 from src.engine.HealthMonitor import HealthMonitor
+from src.engine.DisconnectAlert import DisconnectAlert
 from src.engine.LieAlert import LieAlert
 
 
@@ -98,6 +99,7 @@ class MonsterDetector:
         self._kb = None  # Keyboard controller (set externally)
         self.health_monitor = None  # Health monitor (initialized in start())
         self.lie_alert = LieAlert(cfg)  # 测谎 alert (+ optional mouse-follow if enabled)
+        self.disconnect_alert = DisconnectAlert(cfg)  # 掉线 / 登录选角提醒
 
         # Hunt-mode search state (used when no monsters are detected)
         self._hunt_no_monster_frames = 0
@@ -2979,6 +2981,12 @@ class MonsterDetector:
         self.img_frame = self.get_img_frame()
         if self.img_frame is None or self.img_frame.shape[0] < 300 or self.img_frame.shape[1] < 400:
             logger.warning("Failed to capture game frame (missing/minimized?). Waiting...")
+            if getattr(self, "disconnect_alert", None) is not None:
+                try:
+                    self.disconnect_alert.note_frame_miss(kb=self._kb)
+                except Exception as _disc_e:
+                    if self.frame_count % 120 == 0:
+                        logger.debug(f"[DisconnectAlert] miss error: {_disc_e}")
             if self._kb is not None:
                 self._kb._chase_active = False
                 self._kb.set_command("none none none")
@@ -3005,6 +3013,19 @@ class MonsterDetector:
             except Exception as _lie_e:
                 if self.frame_count % 120 == 0:
                     logger.debug(f"[LieAlert] check error: {_lie_e}")
+
+        # 掉线 / 登录选角提醒（对标 gostart）
+        if getattr(self, "disconnect_alert", None) is not None:
+            try:
+                self.disconnect_alert.maybe_check(
+                    self.img_frame,
+                    self.frame_count,
+                    kb=self._kb,
+                    capture=self.capture,
+                )
+            except Exception as _disc_e:
+                if self.frame_count % 120 == 0:
+                    logger.debug(f"[DisconnectAlert] check error: {_disc_e}")
 
         # Update health monitor with bottom UI strip
         if self.health_monitor is not None:
@@ -3184,14 +3205,35 @@ class MonsterDetector:
                     self._kb.set_command("none none none")
                 except Exception:
                     pass
-            elif getattr(self, "lie_alert", None) is not None and getattr(self.lie_alert, "visible", False):
-                # Keep standing while 测谎 is up; mouse-follow handles the mini-game
+            elif (
+                (
+                    getattr(self, "lie_alert", None) is not None
+                    and getattr(self.lie_alert, "visible", False)
+                )
+                or (
+                    getattr(self, "disconnect_alert", None) is not None
+                    and getattr(self.disconnect_alert, "visible", False)
+                )
+            ):
+                # Keep standing while 测谎 / 掉线提醒 is up
                 try:
                     self._kb._chase_active = False
                     self._kb.set_command("none none none")
-                    self._kb.pause_for_lie_alert(
-                        float((self.cfg.get("lie_alert") or {}).get("freeze_seconds", 3.0))
+                    freeze_s = float(
+                        (self.cfg.get("lie_alert") or {}).get("freeze_seconds", 3.0)
                     )
+                    if getattr(self, "disconnect_alert", None) is not None and getattr(
+                        self.disconnect_alert, "visible", False
+                    ):
+                        freeze_s = max(
+                            freeze_s,
+                            float(
+                                (self.cfg.get("disconnect_alert") or {}).get(
+                                    "freeze_seconds", freeze_s
+                                )
+                            ),
+                        )
+                    self._kb.pause_for_lie_alert(freeze_s)
                 except Exception:
                     pass
             elif self.cfg["bot"].get("enable_route") and self.img_route is not None:
@@ -3206,7 +3248,13 @@ class MonsterDetector:
                 self.cfg.get("directional_attack", {}).get("attack_in_place", False)
             )
 
-            lie_up = bool(getattr(self, "lie_alert", None) is not None and getattr(self.lie_alert, "visible", False))
+            lie_up = bool(
+                getattr(self, "lie_alert", None) is not None
+                and getattr(self.lie_alert, "visible", False)
+            ) or bool(
+                getattr(self, "disconnect_alert", None) is not None
+                and getattr(self.disconnect_alert, "visible", False)
+            )
             station_hold = bool(
                 self.cfg.get("directional_attack", {}).get("station_hold", False)
             )
@@ -3541,7 +3589,8 @@ class MonsterDetector:
                 logger.info(
                     f"[Loop] fps={self.fps} frame_ms={frame_duration*1000:.0f} "
                     f"viz={int(bool(self.is_show_debug))} "
-                    f"lie={int(bool(getattr(getattr(self,'lie_alert',None),'visible',False)))}"
+                    f"lie={int(bool(getattr(getattr(self,'lie_alert',None),'visible',False)))} "
+                    f"disc={int(bool(getattr(getattr(self,'disconnect_alert',None),'visible',False)))}"
                 )
 
     def cleanup(self):

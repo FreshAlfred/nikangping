@@ -48,6 +48,8 @@ class LieAlert:
         self.match_threshold = float(la.get("match_threshold", 0.18))
         # Tiny/CN phone crops false-match easily — require near-perfect SQDIFF
         self.cn_title_match_threshold = float(la.get("cn_title_match_threshold", 0.035))
+        # 0–100 like gostart「灵敏度」: higher → slightly looser SQDIFF accept
+        self.sensitivity = float(la.get("sensitivity", 50.0))
         self.check_interval_frames = max(1, int(la.get("check_interval_frames", 15)))
         self.alert_cooldown_s = float(la.get("alert_cooldown_s", 2.0))
         self.freeze_seconds = float(la.get("freeze_seconds", 8.0))
@@ -116,6 +118,11 @@ class LieAlert:
         # Short settle only; never use this to ignore a large user yank.
         self.mouse_move_grace_s = float(la.get("mouse_move_grace_s", 0.08))
         self.lose_target_grace_s = float(la.get("lose_target_grace_s", 1.2))
+        self.predict_coast_s = float(la.get("predict_coast_s", 0.30))
+        self.control_min_confidence = float(la.get("control_min_confidence", 0.42))
+        self.opening_confirm_frames = max(1, int(la.get("opening_confirm_frames", 4)))
+        self.opening_confirm_timeout_s = float(la.get("opening_confirm_timeout_s", 8.0))
+        self.heatmap_enable = bool(la.get("heatmap_enable", True))
         # White can flicker 1–2 frames at low FPS; do not flip to YOLO immediately.
         self.white_miss_grace_s = float(la.get("white_miss_grace_s", 0.45))
         # Wall-clock YOLO throttle (CPU predict was freezing the AFK loop ~2fps).
@@ -334,6 +341,15 @@ class LieAlert:
 
         self._load_templates()
         self._load_shape_templates()
+        self._heatmap = None
+        if self.enable and self.auto_follow and self.heatmap_enable:
+            try:
+                from src.engine.lie_heatmap_tracker import LieHeatmapTracker
+
+                self._heatmap = LieHeatmapTracker(cfg)
+            except Exception as e:
+                logger.warning(f"[LieAlert] heatmap tracker unavailable: {e}")
+                self._heatmap = None
         # Do NOT warm RapidOCR here — loading + first infer stalls startup and
         # idle AFK. It loads lazily on the rare OCR fallback path.
         # Preload peak/YOLO off-thread so the first lie session does not freeze
@@ -343,7 +359,9 @@ class LieAlert:
         # Prebuild alert WAV so the first 测谎 hit is not delayed by synth.
         if self.enable:
             try:
-                self._alert_wav_path()
+                from src.utils.alert_siren import warm_alert_wav
+
+                warm_alert_wav()
             except Exception:
                 pass
 
@@ -360,6 +378,9 @@ class LieAlert:
         self.match_threshold = float(la.get("match_threshold", self.match_threshold))
         self.cn_title_match_threshold = float(
             la.get("cn_title_match_threshold", self.cn_title_match_threshold)
+        )
+        self.sensitivity = float(
+            la.get("sensitivity", getattr(self, "sensitivity", 50.0))
         )
         self.check_interval_frames = max(
             1, int(la.get("check_interval_frames", self.check_interval_frames))
@@ -388,6 +409,33 @@ class LieAlert:
             kws = [kws]
         self.ocr_keywords = [str(k).strip() for k in kws if str(k).strip()]
         self.auto_follow = bool(la.get("auto_follow", self.auto_follow))
+        self.heatmap_enable = bool(
+            la.get("heatmap_enable", getattr(self, "heatmap_enable", True))
+        )
+        self.predict_coast_s = float(
+            la.get("predict_coast_s", getattr(self, "predict_coast_s", 0.30))
+        )
+        self.control_min_confidence = float(
+            la.get(
+                "control_min_confidence",
+                getattr(self, "control_min_confidence", 0.42),
+            )
+        )
+        self.opening_confirm_frames = max(
+            1,
+            int(
+                la.get(
+                    "opening_confirm_frames",
+                    getattr(self, "opening_confirm_frames", 4),
+                )
+            ),
+        )
+        self.opening_confirm_timeout_s = float(
+            la.get(
+                "opening_confirm_timeout_s",
+                getattr(self, "opening_confirm_timeout_s", 8.0),
+            )
+        )
         self.follow_start_delay_s = float(
             la.get("follow_start_delay_s", self.follow_start_delay_s)
         )
@@ -395,6 +443,18 @@ class LieAlert:
         self.follow_interval_frames = max(
             1, int(la.get("follow_interval_frames", self.follow_interval_frames))
         )
+        if (
+            self.enable
+            and self.auto_follow
+            and self.heatmap_enable
+            and getattr(self, "_heatmap", None) is None
+        ):
+            try:
+                from src.engine.lie_heatmap_tracker import LieHeatmapTracker
+
+                self._heatmap = LieHeatmapTracker(self.cfg)
+            except Exception:
+                self._heatmap = None
         self.shape_match_threshold = float(
             la.get(
                 "shape_match_threshold",
@@ -954,7 +1014,8 @@ class LieAlert:
                 self._session_alert_played = True
                 via = hit or self._last_hit or "hold"
                 logger.warning(
-                    f"[ALERT] 测谎 detected via {via} (score={self._last_score:.3f}, "
+                    f"[ALERT] 小游戏出现提醒 via {via} (score={self._last_score:.3f}, "
+                    f"sens={float(getattr(self, 'sensitivity', 50.0)):.0f}, "
                     f"hold={max(0.0, self._hold_until - now):.1f}s) — pause AFK"
                     + (
                         ", auto-follow shape"
@@ -1089,19 +1150,29 @@ class LieAlert:
             or ("title" in base and "en" not in base and "lie.png" != base)
         )
 
+    def _sensitivity_scale(self) -> float:
+        """Map sensitivity 0–100 → SQDIFF multiplier (50=1.0, higher=looser)."""
+        s = max(0.0, min(100.0, float(getattr(self, "sensitivity", 50.0) or 50.0)))
+        return 0.7 + (s / 100.0) * 0.7
+
     def _threshold_for_template(self, path: str) -> float:
+        scale = self._sensitivity_scale()
         if self._is_cn_title_template(path):
-            return float(self.cn_title_match_threshold)
+            thr = float(self.cn_title_match_threshold) * scale
+            return max(0.015, min(0.055, thr))
         base = os.path.basename(path).lower()
         # Intro instruction panel (「3秒后…」): very tight — sky/cloud false
         # matches sit around 0.04–0.08 on this client.
         if "intro_body" in base or "intro_banner" in base:
-            return float(
+            base_thr = float(
                 (self.cfg.get("lie_alert") or {}).get(
                     "intro_match_threshold", 0.025
                 )
             )
-        return float(self.match_threshold)
+            thr = base_thr * scale
+            return max(0.012, min(0.040, thr))
+        thr = float(self.match_threshold) * scale
+        return max(0.06, min(0.22, thr))
 
     @staticmethod
     def _is_intro_template(path: str) -> bool:
@@ -1153,7 +1224,8 @@ class LieAlert:
         self._last_alert_t = now
         self._session_alert_played = True
         logger.warning(
-            f"[ALERT] 测谎 detected via {hit} (score={self._last_score:.3f}, "
+            f"[ALERT] 小游戏出现提醒 via {hit} (score={self._last_score:.3f}, "
+            f"sens={float(getattr(self, 'sensitivity', 50.0)):.0f}, "
             f"hold={max(0.0, self._hold_until - now):.1f}s) — pause AFK"
             + (", auto-follow shape" if self.auto_follow else ", answer manually")
         )
@@ -1179,8 +1251,17 @@ class LieAlert:
         self._stale_ban_xy = None
         self._stale_ban_until = 0.0
         self._follow_started_logged = False
+        self._opening_confirm_logged = False
+        self._opening_confirmed_local = False
+        self._opening_hits_local = 0
+        self._opening_local_t0 = 0.0
         self._delay_hold_log_t = 0.0
         self._intro_hold_log_t = 0.0
+        if getattr(self, "_heatmap", None) is not None:
+            try:
+                self._heatmap.reset(now)
+            except Exception:
+                pass
         if not self.auto_follow:
             # Alert-only: no follow delay, no BG model, no YOLO warm.
             self._follow_ready_t = now
@@ -1649,14 +1730,111 @@ class LieAlert:
         gap = (now - prev_tick) if prev_tick > 0 else 0.0
         self._follow_tick_t = now
         pt = self._locate_shape(img_bgr, now)
-        if pt is not None:
-            # White can park on a static false highlight. Keep stale-unlock
-            # for the whole white phase (not just the first ~12 frames).
-            name = getattr(self, "_last_shape_name", "") or ""
-            white_phase = name == "white" and float(getattr(self, "_white_gone_t", 0.0) or 0.0) <= 0.0
+        name = getattr(self, "_last_shape_name", "") or ""
+        hm = getattr(self, "_heatmap", None)
+
+        # --- gostart-style: confirm opening white before any mouse move ---
+        if hm is not None and not hm.opening_confirmed:
+            white_hit = (
+                pt is not None
+                and name == "white"
+                and float(getattr(self, "_white_gone_t", 0.0) or 0.0) <= 0.0
+            )
+            if white_hit:
+                hm.note_opening_white(True, now)
+            else:
+                hm.note_opening_white(False, now)
+            if pt is not None:
+                self.debug_pt = (int(pt[0]), int(pt[1]))
+                self._locked = True
+                self._last_seen_t = now
+            if not hm.opening_confirmed:
+                if hm.opening_timed_out(now):
+                    # Timeout: still arm follow (heatmap + classic), don't stay alert-only forever.
+                    hm._opening_confirmed = True
+                    hm._active = True
+                    logger.info(
+                        "[LieAlert] opening_confirm timeout — arm follow "
+                        "(heatmap/classic fallback)"
+                    )
+                else:
+                    self.following = False
+                    if now - float(getattr(self, "_opening_log_t", 0.0) or 0.0) > 1.0:
+                        self._opening_log_t = now
+                        logger.info(
+                            f"[LieAlert] opening_confirm "
+                            f"hits={hm._opening_hits}/{hm.opening_confirm_frames} "
+                            f"(no mouse until white locked)"
+                        )
+                    return
+            if not getattr(self, "_opening_confirm_logged", False):
+                self._opening_confirm_logged = True
+                logger.info(
+                    "[LieAlert] opening_confirm ok — mouse follow enabled"
+                )
+
+        # No heatmap module: still require opening white confirms before mouse.
+        if hm is None:
+            if not bool(getattr(self, "_opening_confirmed_local", False)):
+                white_hit = (
+                    pt is not None
+                    and name == "white"
+                    and float(getattr(self, "_white_gone_t", 0.0) or 0.0) <= 0.0
+                )
+                hits = int(getattr(self, "_opening_hits_local", 0) or 0)
+                hits = hits + 1 if white_hit else max(0, hits - 1)
+                self._opening_hits_local = hits
+                need = int(getattr(self, "opening_confirm_frames", 4) or 4)
+                if pt is not None:
+                    self.debug_pt = (int(pt[0]), int(pt[1]))
+                if hits < need:
+                    t0 = float(getattr(self, "_opening_local_t0", 0.0) or now)
+                    if getattr(self, "_opening_local_t0", 0.0) <= 0:
+                        self._opening_local_t0 = now
+                        t0 = now
+                    if (now - t0) < float(
+                        getattr(self, "opening_confirm_timeout_s", 8.0) or 8.0
+                    ):
+                        self.following = False
+                        return
+                self._opening_confirmed_local = True
+                if not getattr(self, "_opening_confirm_logged", False):
+                    self._opening_confirm_logged = True
+                    logger.info("[LieAlert] opening_confirm ok — mouse follow enabled")
+
+        move_pt = None
+        move_src = ""
+
+        # Heatmap path (preferred after confirm)
+        if hm is not None and hm.opening_confirmed:
+            inject = None
+            inj_w = 0.0
+            if pt is not None and name in (
+                "white",
+                "yolo",
+                "fill",
+                "faded",
+                "outlier",
+                "spinback",
+            ):
+                inject = (float(pt[0]), float(pt[1]))
+                inj_w = 0.55 if name == "white" else 0.35
+            try:
+                est = hm.push(img_bgr, now, inject_xy=inject, inject_weight=inj_w)
+            except Exception:
+                est = None
+            if est is not None and hm.may_move(est):
+                move_pt = (float(est.x), float(est.y))
+                move_src = f"heatmap/{est.source}"
+                self.debug_pt = (int(est.x), int(est.y))
+
+        # Classic locate fallback (solid detections only — fail-closed vs coast)
+        if move_pt is None and pt is not None and name not in ("coast", "flow", "patch", "motion"):
+            white_phase = name == "white" and float(
+                getattr(self, "_white_gone_t", 0.0) or 0.0
+            ) <= 0.0
             if white_phase:
                 if gap >= max(0.5, float(self.stale_lock_s)):
-                    # Loop was frozen — reset stale clock; do not unlock.
                     self._lock_anchor_xy = (float(pt[0]), float(pt[1]))
                     self._lock_moved_t = now
                 elif self._lock_anchor_xy is None:
@@ -1671,40 +1849,59 @@ class LieAlert:
                     elif (now - self._lock_moved_t) >= self.stale_lock_s:
                         self._clear_lock("stale_static", now)
                         return
+            move_pt = (float(pt[0]), float(pt[1]))
+            move_src = name or "locate"
+            self.debug_pt = (int(pt[0]), int(pt[1]))
 
+        if move_pt is not None:
             self._last_seen_t = now
             self._locked = True
-            self.debug_pt = (int(pt[0]), int(pt[1]))
             self.following = True
-            # Top-up sticky while following so a 35s hold does not end mid-game
-            # after a long stall (00:16:48 + 35s == session end).
             self._hold_until = max(float(self._hold_until), now + 8.0)
-            self._move_mouse_to_frame_point(pt, capture)
+            self._move_mouse_to_frame_point(move_pt, capture)
             if now - self._follow_log_t > 1.0:
                 self._follow_log_t = now
-                name = self._last_shape_name or "white"
                 logger.info(
-                    f"[LieAlert] following shape={name} locked={self._locked} @ "
-                    f"frame=({pt[0]:.0f},{pt[1]:.0f})"
+                    f"[LieAlert] following shape={move_src} locked={self._locked} @ "
+                    f"frame=({move_pt[0]:.0f},{move_pt[1]:.0f})"
                 )
             return
 
-        # Brief coast on velocity — do NOT jump to unrelated blobs
-        if self._locked and self._track_xy is not None and (
-            now - self._last_seen_t
-        ) < self.lose_target_grace_s:
-            vx, vy = self._track_vel
-            # Dampen prediction so we don't fly off
-            pred = (
-                self._track_xy[0] + vx * 0.03,
-                self._track_xy[1] + vy * 0.03,
-            )
+        # Short cursor prediction only (gostart-like); not the long lose_target coast.
+        coast_s = float(getattr(self, "predict_coast_s", 0.30))
+        if (
+            self._locked
+            and self._track_xy is not None
+            and (now - self._last_seen_t) < coast_s
+            and getattr(self, "_mouse_placed_xy", None) is not None
+        ):
+            pred = None
+            if hm is not None:
+                try:
+                    pest = hm.predict_coast()
+                    if pest is not None and hm.may_move(pest):
+                        pred = (float(pest.x), float(pest.y))
+                        move_src = "heatmap/predict"
+                except Exception:
+                    pred = None
+            if pred is None:
+                vx, vy = self._track_vel
+                pred = (
+                    self._track_xy[0] + vx * 0.03,
+                    self._track_xy[1] + vy * 0.03,
+                )
+                move_src = "predict"
             self.debug_pt = (int(pred[0]), int(pred[1]))
             self.following = True
             self._move_mouse_to_frame_point(pred, capture)
             return
 
-        self._clear_lock("lost", now)
+        # Fail-closed: no confident point → do not yank the mouse.
+        self.following = False
+        if self._locked and (now - self._last_seen_t) >= max(
+            coast_s, float(self.lose_target_grace_s)
+        ):
+            self._clear_lock("lost", now)
 
     def _seed_flow_and_patch(self, gray, cx: float, cy: float, bbox=None):
         """Init LK points + grayscale patch around an acquire hit."""
@@ -4535,92 +4732,18 @@ class LieAlert:
 
     def _play_loud_alert(self):
         """Non-blocking loud alert (WAV siren + system beeps)."""
-        with self._sound_lock:
-            if self._sound_thread is not None and self._sound_thread.is_alive():
-                return
-            self._sound_thread = threading.Thread(
-                target=self._sound_worker, daemon=True, name="LieAlertSound"
-            )
-            self._sound_thread.start()
+        from src.utils.alert_siren import play_loud_alert
+
+        play_loud_alert("小游戏出现提醒")
 
     @classmethod
     def _alert_wav_path(cls) -> str:
-        """Cached loud stereo siren WAV under temp (regenerated if missing)."""
-        import math
-        import struct
-        import tempfile
-        import wave
+        from src.utils.alert_siren import alert_wav_path
 
-        path = os.path.join(tempfile.gettempdir(), "lie_alert_siren_v2.wav")
-        if os.path.isfile(path) and os.path.getsize(path) > 1000:
-            return path
-        rate = 22050
-        secs = 1.6
-        n = int(rate * secs)
-        buf = bytearray()
-        for i in range(n):
-            t = i / rate
-            # Two-tone siren, near-full amplitude so mixer can hear over the game.
-            f = 1760.0 if (int(t * 5) % 2 == 0) else 880.0
-            env = 0.55 + 0.45 * abs(math.sin(2 * math.pi * 2.5 * t))
-            v = int(32000 * env * math.sin(2 * math.pi * f * t))
-            v = max(-32767, min(32767, v))
-            buf.extend(struct.pack("<h", v))
-        with wave.open(path, "w") as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(rate)
-            w.writeframes(bytes(buf))
-        return path
+        return alert_wav_path()
 
     @classmethod
     def _sound_worker(cls):
-        ok = False
-        try:
-            print("\a\a\a *** 测谎 ALERT ***", flush=True)
-        except Exception:
-            pass
-        try:
-            import winsound
-        except ImportError:
-            logger.warning("[LieAlert] winsound missing — no alert sound")
-            return
-        # 1) Loud WAV through the normal audio device (survives muted system-schemes).
-        try:
-            wav = cls._alert_wav_path()
-            for _ in range(2):
-                winsound.PlaySound(wav, winsound.SND_FILENAME | winsound.SND_NODEFAULT)
-                ok = True
-        except Exception as e:
-            logger.warning(f"[LieAlert] alert WAV failed: {e}")
-        # 2) System beeps as backup (some setups only hear one path).
-        try:
-            for _ in range(3):
-                try:
-                    winsound.MessageBeep(winsound.MB_ICONHAND)
-                except Exception:
-                    pass
-                try:
-                    winsound.Beep(2000, 250)
-                    winsound.Beep(1100, 200)
-                    winsound.Beep(2000, 300)
-                    ok = True
-                except Exception:
-                    try:
-                        winsound.PlaySound(
-                            "SystemHand",
-                            winsound.SND_ALIAS | winsound.SND_NODEFAULT,
-                        )
-                        ok = True
-                    except Exception:
-                        pass
-                time.sleep(0.05)
-        except Exception as e:
-            logger.warning(f"[LieAlert] alert beep failed: {e}")
-        if ok:
-            logger.info("[LieAlert] alert sound played")
-        else:
-            logger.warning(
-                "[LieAlert] alert sound FAILED — check Windows volume mixer "
-                "for python.exe / system sounds"
-            )
+        from src.utils.alert_siren import _sound_worker
+
+        _sound_worker("小游戏出现提醒")
