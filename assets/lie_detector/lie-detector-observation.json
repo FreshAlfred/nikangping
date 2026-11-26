@@ -1,0 +1,139 @@
+{
+  "format_version": 1,
+  "model": "fused causal residual heatmap observation ensemble",
+  "input": {
+    "name": "features",
+    "shape": [
+      1,
+      10,
+      96,
+      144
+    ],
+    "dtype": "float32"
+  },
+  "output": {
+    "name": "probability",
+    "shape": [
+      1,
+      96,
+      144
+    ],
+    "normalized": true
+  },
+  "old_ensemble_weight": 0.5,
+  "synthetic_finetune_weight": 0.5,
+  "checkpoints": [
+    {
+      "name": "short",
+      "architecture": "v1",
+      "channels": 9,
+      "base": 12,
+      "weight_in_old_ensemble": 0.0625,
+      "sha256": "1b305bf95d0555f1f43b28556703a9628d9a1e23cd063798df208b83936a4cd9"
+    },
+    {
+      "name": "long",
+      "architecture": "v1",
+      "channels": 9,
+      "base": 12,
+      "weight_in_old_ensemble": 0.125,
+      "sha256": "f9dac74bfc8e9e4b1ecf76707adedc103b79c3a2b615c11d9bf50be4367fd642"
+    },
+    {
+      "name": "raw10",
+      "architecture": "v1",
+      "channels": 10,
+      "base": 12,
+      "weight_in_old_ensemble": 0.0625,
+      "sha256": "6a5badee2a5bfff41cd35bf4cc05a3d943425a6761b5ddde45a2d71181f6b5be"
+    },
+    {
+      "name": "v2_seed1",
+      "architecture": "v2",
+      "channels": 10,
+      "base": 20,
+      "weight_in_old_ensemble": 0.25,
+      "sha256": "1e0c4936166302c55af4711b6b1d968cec06deabaefe1ff6eed3f64e18fed11e"
+    },
+    {
+      "name": "v2_seed2",
+      "architecture": "v2",
+      "channels": 10,
+      "base": 20,
+      "weight_in_old_ensemble": 0.25,
+      "sha256": "04c997751812df50657b794e553c6142ff0546386e14b026778e53143f3abe07"
+    },
+    {
+      "name": "v2_seed3",
+      "architecture": "v2",
+      "channels": 10,
+      "base": 24,
+      "weight_in_old_ensemble": 0.25,
+      "sha256": "1de40aea9f4b39189ebde3acca1d5228579dd2a4a5e7fdfddfac1602613d3edd"
+    }
+  ],
+  "synthetic_checkpoint": {
+    "architecture": "v2",
+    "channels": 10,
+    "base": 24,
+    "sha256": "66fd4ec20ae044a37c87961c506a763b1e55e65c93c3a516517032a0f5b733ae"
+  },
+  "temporal_filter": {
+    "learning": {
+      "sigma": 5.0,
+      "measurement_power": 2.0,
+      "uniform_floor": 0.01,
+      "recovery": 0.1
+    },
+    "active": {
+      "sigma": 3.0,
+      "measurement_power": 2.5,
+      "uniform_floor": 0.01,
+      "recovery": 0.025
+    },
+    "velocity_gain": 1.0,
+    "velocity_momentum": 0.5,
+    "velocity_max_work_px": 10.0,
+    "patch_observation": "disabled; no independently deployable runtime artifact"
+  },
+  "confidence_calibration": {
+    "target": "center_error_le_26px",
+    "method": "logistic",
+    "source": "six session-disjoint development-validation sessions",
+    "sample_count": 756,
+    "features": [
+      "normalized_heatmap_concentration",
+      "primary_peak_dominance",
+      "learning_phase_indicator"
+    ],
+    "coefficients": {
+      "intercept": -0.1727907,
+      "normalized_heatmap_concentration": 1.84598363,
+      "primary_peak_dominance": 3.60162816,
+      "learning_phase_indicator": 0.00876922
+    },
+    "ambiguity_cap_starts_at_secondary_peak_ratio": 0.78,
+    "boundary_confidence_cap": 0.25
+  },
+  "tracking_safety": {
+    "motion_source": "held-out historical trajectories",
+    "normal_gap_max_seconds": 0.35,
+    "innovation_gate": "20px + 180px_per_second * min(delta_t, 0.35s)",
+    "held_out_normal_motion_coverage": 0.991,
+    "prediction_only_frames": 2,
+    "far_relocalization_confirmation_frames": 3,
+    "far_relocalization_cluster_radius_px": 50.0
+  },
+  "onnx": {
+    "opset": 17,
+    "sha256": "3053d438929e6043a9304231b8712cdf2b23c85712bfd730f0b19bd25dc5f095",
+    "size_bytes": 20564326,
+    "pytorch_max_abs_error": 1.1408701539039612e-08,
+    "probability_sum_max_abs_error": 1.1920928955078125e-07
+  },
+  "evaluation": {
+    "validation_with_patch_mean_px": 11.236,
+    "historical_pixel_only_mean_px": 17.57,
+    "status": "development model; target of <=10px mean is not yet met"
+  }
+}
