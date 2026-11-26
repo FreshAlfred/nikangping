@@ -236,12 +236,13 @@ lie_alert:
     - "LIE DETECTOR"
     - "Lie Detector"
   auto_follow: true
-  # gostart 式热力图跟形（自有 lie_heatmap.onnx，非 gostart 权重）
+  # gostart lie-detector-observation.onnx（特征对齐 _build_features，/255）
   heatmap_enable: true
-  heatmap_model: "assets/lie_detector/lie_heatmap.onnx"
+  heatmap_model: "assets/lie_detector/lie-detector-observation.onnx"
+  heatmap_meta: "assets/lie_detector/lie-detector-observation.json"
   opening_confirm_frames: 4      # 连续白形命中后才首次移鼠
   opening_confirm_timeout_s: 8.0 # 超时后仍武装，改走热力图/经典回退
-  control_min_confidence: 0.42   # fail-closed：低于此不移鼠
+  control_min_confidence: 0.60   # 对标 gostart OBSERVED_CONTROL_MIN_CONFIDENCE
   heatmap_ambiguity_secondary_ratio: 0.78
   predict_coast_s: 0.30          # 短时预测跟（光标）；内部 RED 仍可用 lose_target_grace
   record_clip: false
@@ -257,7 +258,8 @@ lie_alert:
   dialog_miss_limit: 5
   dialog_min_session_s: 20.0
   mouse_takeover_px: 40
-  mouse_move_grace_s: 0.08
+  mouse_move_grace_s: 0.22          # 跳点未落稳时重吸；让出只认鼠标中键按一次
+  # 人为干预：鼠标中键按一下才退出跟形（挪鼠/左键/右键都不让出）
   white_miss_grace_s: 0.45
   follow_start_delay_s: 0.5
   follow_timeout_s: 60.0
@@ -430,8 +432,8 @@ profiles:
       template: "character/name.png"
     aoe_skill:
       attack_combo: []                 # 群攻键 = key.aoe_skill (A)
-      cooldown_min: 1.5
-      cooldown_max: 2.0
+      cooldown_min: 0.7                # 加快站桩 A 频率
+      cooldown_max: 1.0
     walk_teleport:
       enable: false                    # 定点站桩，不闪现
     bot:
@@ -446,10 +448,11 @@ profiles:
     monster_detect:
       enable: false
     buff_skill:
-      keys: ["w", "shift", "end"]      # 与 F1 一致
-      cooldown: [120, 300, 1500]
-      wait_before_combat: true
-      freeze_seconds: 2.5
-      action_cooldown: 1.5
+      keys: []                         # F3 不施放 buff（End 改宠物喂养）
+      wait_before_combat: false
     pet_feed:
-      enable: false
+      enable: true
+      key: "end"
+      interval_s: 720                  # 12 分钟
+      startup_delay_s: 2.0             # 开 F3 后约 2s 先喂一次
+      press_duration: 0.08

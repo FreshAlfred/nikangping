@@ -1,26 +1,38 @@
 # -*- coding: utf-8 -*-
 """
-Gostart-inspired causal heatmap tracker for the lie-detector mini-game.
+Causal heatmap tracker driven by gostart's lie-detector-observation.onnx.
 
-Contract (aligned with gostart lie-detector-observation.json):
-  features  [1, 10, 96, 144] float32
-  probability [1, 96, 144] float32 (sums ~1)
-
-First-party model: hand-crafted ONNX over heuristic channels (not gostart weights).
-Existing white/YOLO peaks can inject a soft measurement for bootstrap.
+Pipeline (aligned with tracker.pyd LieDetectorMLTrackingSession):
+  1) take 752×501 BGR puzzle crop (from dialog ROI)
+  2) green wipe → gray → INTER_AREA work frame (144×96)
+  3) `_build_features` replica → uint8 (10,96,144) → float32 / 255
+  4) ONNX → already-normalized probability [1,96,144]
+  5) belief filter + calibrated confidence → frame-space point
 """
 from __future__ import annotations
 
+import json
+import math
 import os
+from collections import deque
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Deque, Optional, Tuple
 
 import cv2
 import numpy as np
 
-WORK_H = 96
-WORK_W = 144
-FEATURE_CHANNELS = 10
+from src.engine.gostart_lie_features import (
+    WORK_H,
+    WORK_W,
+    build_features as gostart_build_features,
+    prepare_gray,
+    registered_previous,
+)
+
+CROP_W = 752
+CROP_H = 501
+DEFAULT_MODEL = "assets/lie_detector/lie-detector-observation.onnx"
+DEFAULT_META = "assets/lie_detector/lie-detector-observation.json"
 
 
 @dataclass
@@ -33,69 +45,8 @@ class HeatmapEstimate:
     work_xy: Tuple[float, float]
 
 
-def export_lie_heatmap_onnx(path: str) -> str:
-    """
-    Export a tiny fixed-weight heatmap head.
-
-    Channel roles (must match build_features):
-      0 gray, 1 absdiff, 2 white, 3 residual, 4 V, 5 inv-S,
-      6 edge, 7 soft-diff, 8 not-green, 9 prior
-    """
-    import onnx
-    from onnx import TensorProto, helper, numpy_helper
-
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    # 1x1 conv: mix channels → single logit map
-    w = np.zeros((1, FEATURE_CHANNELS, 1, 1), dtype=np.float32)
-    w[0, 0, 0, 0] = 0.15  # gray
-    w[0, 1, 0, 0] = 0.90  # motion
-    w[0, 2, 0, 0] = 1.40  # white
-    w[0, 3, 0, 0] = 0.55  # residual
-    w[0, 4, 0, 0] = 0.25  # V
-    w[0, 5, 0, 0] = 0.35  # inv-S
-    w[0, 6, 0, 0] = 0.20  # edge
-    w[0, 7, 0, 0] = 0.70  # soft diff
-    w[0, 8, 0, 0] = 0.10  # not-green
-    w[0, 9, 0, 0] = 0.80  # prior
-    b = np.array([-0.35], dtype=np.float32)
-
-    feats = helper.make_tensor_value_info(
-        "features", TensorProto.FLOAT, [1, FEATURE_CHANNELS, WORK_H, WORK_W]
-    )
-    # Keep spatial size; softmax over HxW via Reshape trick done in Python.
-    # ONNX graph only emits logits; runtime normalizes.
-    logits = helper.make_tensor_value_info(
-        "logits", TensorProto.FLOAT, [1, 1, WORK_H, WORK_W]
-    )
-    graph = helper.make_graph(
-        nodes=[
-            helper.make_node(
-                "Conv",
-                ["features", "W", "B"],
-                ["logits"],
-                kernel_shape=[1, 1],
-                pads=[0, 0, 0, 0],
-                strides=[1, 1],
-            ),
-        ],
-        name="lie_heatmap",
-        inputs=[feats],
-        outputs=[logits],
-        initializer=[
-            numpy_helper.from_array(w, name="W"),
-            numpy_helper.from_array(b, name="B"),
-        ],
-    )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-    onnx.save(model, path)
-    return path
-
-
 def _remove_green_cursor(bgr: np.ndarray) -> np.ndarray:
-    """Neutralize bright green reticle / marker (gostart-style)."""
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    # Typical overlay greens
     m1 = cv2.inRange(hsv, (40, 80, 80), (95, 255, 255))
     m2 = cv2.inRange(bgr, (0, 180, 0), (120, 255, 120))
     mask = cv2.bitwise_or(m1, m2)
@@ -106,100 +57,127 @@ def _remove_green_cursor(bgr: np.ndarray) -> np.ndarray:
     return out
 
 
-def build_features(
-    bgr: np.ndarray,
-    prev_gray: Optional[np.ndarray],
-    prior_work: Optional[np.ndarray],
-):
+def extract_puzzle_crop(
+    frame_bgr: np.ndarray,
+    dialog_xyxy: Optional[Tuple[int, int, int, int]] = None,
+) -> Tuple[np.ndarray, float, float, float, float]:
     """
-    Returns features [1,10,H,W], work BGR, (sx, sy, ox, oy), gray work.
-    Full-frame resize: ox=oy=0, sx=WORK_W/fw, sy=WORK_H/fh.
+    Return (crop752x501, ox, oy, sx, sy) mapping crop-local → frame:
+      frame_x = ox + local_x * sx
+      frame_y = oy + local_y * sy
     """
-    clean = _remove_green_cursor(bgr)
-    fh, fw = clean.shape[:2]
-    work = cv2.resize(clean, (WORK_W, WORK_H), interpolation=cv2.INTER_AREA)
-    gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
-    hsv = cv2.cvtColor(work, cv2.COLOR_BGR2HSV)
-    h, s, v = cv2.split(hsv)
-    sf = s.astype(np.float32) / 255.0
-    vf = v.astype(np.float32) / 255.0
-    white = (
-        (vf >= 0.72) & (sf <= 0.28)
-    ).astype(np.float32)
-    blur = cv2.GaussianBlur(gray, (0, 0), 2.0)
-    residual = np.clip(gray - blur + 0.5, 0.0, 1.0)
-    if prev_gray is None or prev_gray.shape != gray.shape:
-        absdiff = np.zeros_like(gray)
-        soft_diff = absdiff
+    fh, fw = frame_bgr.shape[:2]
+    if dialog_xyxy is None:
+        x0, y0 = int(fw * 0.22), int(fh * 0.22)
+        x1, y1 = int(fw * 0.78), int(fh * 0.78)
     else:
-        absdiff = np.abs(gray - prev_gray)
-        soft_diff = cv2.GaussianBlur(absdiff, (0, 0), 1.2)
-    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-    edge = np.clip(np.sqrt(gx * gx + gy * gy) / 4.0, 0.0, 1.0)
-    # not-green
-    green = cv2.inRange(hsv, (40, 80, 80), (95, 255, 255)).astype(np.float32) / 255.0
-    not_green = 1.0 - green
-    if prior_work is None or prior_work.shape != (WORK_H, WORK_W):
-        prior = np.zeros_like(gray)
-    else:
-        prior = prior_work.astype(np.float32)
-        ssum = float(prior.sum())
-        if ssum > 1e-6:
-            prior = prior / ssum * (WORK_H * WORK_W * 0.01)
-        prior = np.clip(prior, 0.0, 1.0)
-
-    chans = [
-        gray,
-        np.clip(absdiff * 3.0, 0.0, 1.0),
-        white,
-        residual,
-        vf,
-        1.0 - sf,
-        edge,
-        np.clip(soft_diff * 3.0, 0.0, 1.0),
-        not_green,
-        prior,
-    ]
-    feat = np.stack(chans, axis=0)[None, ...].astype(np.float32)
-    sx = float(WORK_W) / float(max(1, fw))
-    sy = float(WORK_H) / float(max(1, fh))
-    return feat, work, (sx, sy, 0.0, 0.0), gray
+        x0, y0, x1, y1 = [int(v) for v in dialog_xyxy]
+    x0 = max(0, min(fw - 1, x0))
+    y0 = max(0, min(fh - 1, y0))
+    x1 = max(x0 + 1, min(fw, x1))
+    y1 = max(y0 + 1, min(fh, y1))
+    roi = frame_bgr[y0:y1, x0:x1]
+    rh, rw = roi.shape[:2]
+    if rw >= CROP_W and rh >= CROP_H:
+        cx, cy = rw // 2, rh // 2
+        lx = max(0, min(rw - CROP_W, cx - CROP_W // 2))
+        ly = max(0, min(rh - CROP_H, cy - CROP_H // 2))
+        crop = roi[ly : ly + CROP_H, lx : lx + CROP_W]
+        return crop, float(x0 + lx), float(y0 + ly), 1.0, 1.0
+    # Fallback: stretch ROI to expected puzzle size.
+    crop = cv2.resize(roi, (CROP_W, CROP_H), interpolation=cv2.INTER_AREA)
+    sx = float(rw) / float(CROP_W)
+    sy = float(rh) / float(CROP_H)
+    return crop, float(x0), float(y0), sx, sy
 
 
-def _softmax_map(logits: np.ndarray) -> np.ndarray:
-    x = logits.astype(np.float32).reshape(-1)
-    x = x - float(x.max())
-    e = np.exp(x)
-    e = e / (float(e.sum()) + 1e-12)
-    return e.reshape(WORK_H, WORK_W)
+def work_to_local(work_xy: Tuple[float, float]) -> Tuple[float, float]:
+    """Match gostart _work_to_local on 752×501."""
+    wx, wy = float(work_xy[0]), float(work_xy[1])
+    return wx * (CROP_W - 1) / max(1.0, WORK_W - 1), wy * (CROP_H - 1) / max(
+        1.0, WORK_H - 1
+    )
 
 
-def _peak_stats(prob: np.ndarray) -> Tuple[float, float, float, float]:
-    """Return work_x, work_y, confidence proxy, secondary_peak_ratio."""
+def local_to_work(local_xy: Tuple[float, float]) -> Tuple[float, float]:
+    lx, ly = float(local_xy[0]), float(local_xy[1])
+    return lx * (WORK_W - 1) / max(1.0, CROP_W - 1), ly * (WORK_H - 1) / max(
+        1.0, WORK_H - 1
+    )
+
+
+def _secondary_peak_ratio(prob: np.ndarray, exclusion_radius: int = 4) -> float:
+    flat = prob.reshape(-1)
+    i = int(np.argmax(flat))
+    primary = float(flat[i])
+    if primary <= 1e-12:
+        return 1.0
+    wy, wx = divmod(i, WORK_W)
+    mask = np.ones_like(prob, dtype=bool)
+    y0, y1 = max(0, wy - exclusion_radius), min(WORK_H, wy + exclusion_radius + 1)
+    x0, x1 = max(0, wx - exclusion_radius), min(WORK_W, wx + exclusion_radius + 1)
+    mask[y0:y1, x0:x1] = False
+    secondary = float(prob[mask].max()) if mask.any() else 0.0
+    return secondary / (primary + 1e-12)
+
+
+def _normalized_concentration(prob: np.ndarray) -> float:
+    """Inverse entropy proxy used by gostart calibration (0..1-ish)."""
+    p = prob.astype(np.float64).reshape(-1)
+    s = float(p.sum())
+    if s <= 1e-12:
+        return 0.0
+    p = p / s
+    p = p[p > 1e-12]
+    entropy = float(-(p * np.log(p)).sum())
+    max_entropy = math.log(float(WORK_H * WORK_W))
+    return float(max(0.0, 1.0 - entropy / max(1e-12, max_entropy)))
+
+
+def _local_centroid(prob: np.ndarray, radius: int = 3) -> Tuple[float, float]:
     flat = prob.reshape(-1)
     i = int(np.argmax(flat))
     wy, wx = divmod(i, WORK_W)
-    primary = float(flat[i])
-    # concentration
-    yy, xx = np.mgrid[0:WORK_H, 0:WORK_W]
-    mass = float(prob.sum()) + 1e-12
-    # secondary: max outside exclusion radius
-    excl = 8
-    mask = np.ones_like(prob, dtype=bool)
-    y0, y1 = max(0, wy - excl), min(WORK_H, wy + excl + 1)
-    x0, x1 = max(0, wx - excl), min(WORK_W, wx + excl + 1)
-    mask[y0:y1, x0:x1] = False
-    secondary = float(prob[mask].max()) if mask.any() else 0.0
-    ratio = secondary / (primary + 1e-12)
-    # concentration: inverse of spatial variance of mass
-    cx = float((prob * xx).sum() / mass)
-    cy = float((prob * yy).sum() / mass)
-    var = float((prob * ((xx - cx) ** 2 + (yy - cy) ** 2)).sum() / mass)
-    conc = 1.0 / (1.0 + var / 40.0)
-    dominance = primary / (primary + secondary + 1e-12)
-    conf = float(0.35 * conc + 0.65 * dominance)
-    return float(wx) + 0.5, float(wy) + 0.5, conf, ratio
+    y0, y1 = max(0, wy - radius), min(WORK_H, wy + radius + 1)
+    x0, x1 = max(0, wx - radius), min(WORK_W, wx + radius + 1)
+    patch = prob[y0:y1, x0:x1]
+    total = float(patch.sum())
+    if total <= 1e-12:
+        return float(wx) + 0.5, float(wy) + 0.5
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    return float((patch * xx).sum() / total), float((patch * yy).sum() / total)
+
+
+def _calibrated_confidence(
+    prob: np.ndarray,
+    secondary_ratio: float,
+    *,
+    active_phase: bool,
+    coeffs: dict,
+    ambiguity_cap: float,
+    boundary_cap: float,
+    boundary_clamped: bool = False,
+) -> float:
+    concentration = _normalized_concentration(prob)
+    dominance = 1.0 / (1.0 + max(0.0, float(secondary_ratio)))
+    # remaining mass outside primary peak as soft dominance alt
+    primary = float(prob.max())
+    dominance = primary / (primary + primary * float(secondary_ratio) + 1e-12)
+    logit = (
+        float(coeffs.get("intercept", -0.1727907))
+        + float(coeffs.get("normalized_heatmap_concentration", 1.84598363))
+        * concentration
+        + float(coeffs.get("primary_peak_dominance", 3.60162816)) * dominance
+        + float(coeffs.get("learning_phase_indicator", 0.00876922))
+        * (0.0 if active_phase else 1.0)
+    )
+    conf = 1.0 / (1.0 + math.exp(-logit))
+    if secondary_ratio >= ambiguity_cap:
+        # fail-closed soft cap (gostart may_move rejects; keep conf visible)
+        conf = min(conf, 0.35)
+    if boundary_clamped:
+        conf = min(conf, boundary_cap)
+    return float(conf)
 
 
 class LieHeatmapTracker:
@@ -207,9 +185,12 @@ class LieHeatmapTracker:
         la = (cfg or {}).get("lie_alert") or {}
         self.enable = bool(la.get("heatmap_enable", True))
         self.model_path = str(
-            la.get("heatmap_model", "assets/lie_detector/lie_heatmap.onnx")
+            la.get("heatmap_model", DEFAULT_MODEL)
         ).strip()
-        self.control_min_confidence = float(la.get("control_min_confidence", 0.42))
+        meta_path = str(la.get("heatmap_meta", DEFAULT_META)).strip()
+        self.control_min_confidence = float(
+            la.get("control_min_confidence", 0.60)
+        )
         self.ambiguity_cap = float(
             la.get("heatmap_ambiguity_secondary_ratio", 0.78)
         )
@@ -218,7 +199,9 @@ class LieHeatmapTracker:
             la.get("opening_confirm_timeout_s", 8.0)
         )
         self.predict_coast_s = float(la.get("predict_coast_s", 0.30))
-        # Belief params (gostart numerical contract)
+        self.secondary_excl = 4
+
+        # Belief params from gostart JSON / tracker constants
         self.learn_sigma = 5.0
         self.learn_power = 2.0
         self.learn_floor = 0.01
@@ -230,10 +213,20 @@ class LieHeatmapTracker:
         self.velocity_gain = 1.0
         self.velocity_momentum = 0.5
         self.velocity_max_work_px = 10.0
+        self.calib_coeffs = {
+            "intercept": -0.1727907,
+            "normalized_heatmap_concentration": 1.84598363,
+            "primary_peak_dominance": 3.60162816,
+            "learning_phase_indicator": 0.00876922,
+        }
+        self.boundary_cap = 0.25
+        self._load_meta(meta_path)
 
         self._sess = None
-        self._prev_gray = None
-        self._belief = None  # WORK_H x WORK_W
+        self._input_name = "features"
+        self._output_name = "probability"
+        self._history: Deque[np.ndarray] = deque(maxlen=16)
+        self._belief = None
         self._active = False
         self._vel = np.zeros(2, dtype=np.float32)
         self._last_work_xy = None
@@ -241,32 +234,85 @@ class LieHeatmapTracker:
         self._opening_confirmed = False
         self._opening_start_t = 0.0
         self._last_est: Optional[HeatmapEstimate] = None
+        self._crop_origin = (0.0, 0.0, 1.0, 1.0)  # ox, oy, sx, sy
 
         if self.enable:
             self._ensure_session()
+
+    def _load_meta(self, path: str) -> None:
+        if not path or not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception:
+            return
+        tf = meta.get("temporal_filter") or {}
+        learn = tf.get("learning") or {}
+        active = tf.get("active") or {}
+        self.learn_sigma = float(learn.get("sigma", self.learn_sigma))
+        self.learn_power = float(learn.get("measurement_power", self.learn_power))
+        self.learn_floor = float(learn.get("uniform_floor", self.learn_floor))
+        self.learn_recovery = float(learn.get("recovery", self.learn_recovery))
+        self.active_sigma = float(active.get("sigma", self.active_sigma))
+        self.active_power = float(active.get("measurement_power", self.active_power))
+        self.active_floor = float(active.get("uniform_floor", self.active_floor))
+        self.active_recovery = float(active.get("recovery", self.active_recovery))
+        self.velocity_gain = float(tf.get("velocity_gain", self.velocity_gain))
+        self.velocity_momentum = float(
+            tf.get("velocity_momentum", self.velocity_momentum)
+        )
+        self.velocity_max_work_px = float(
+            tf.get("velocity_max_work_px", self.velocity_max_work_px)
+        )
+        cal = meta.get("confidence_calibration") or {}
+        coeffs = cal.get("coefficients") or {}
+        if coeffs:
+            self.calib_coeffs = {
+                "intercept": float(coeffs.get("intercept", -0.1727907)),
+                "normalized_heatmap_concentration": float(
+                    coeffs.get("normalized_heatmap_concentration", 1.84598363)
+                ),
+                "primary_peak_dominance": float(
+                    coeffs.get("primary_peak_dominance", 3.60162816)
+                ),
+                "learning_phase_indicator": float(
+                    coeffs.get("learning_phase_indicator", 0.00876922)
+                ),
+            }
+        self.ambiguity_cap = float(
+            cal.get(
+                "ambiguity_cap_starts_at_secondary_peak_ratio",
+                self.ambiguity_cap,
+            )
+        )
+        self.boundary_cap = float(cal.get("boundary_confidence_cap", self.boundary_cap))
 
     def _ensure_session(self) -> bool:
         if self._sess is not None:
             return True
         path = self.model_path
         if not os.path.isfile(path):
-            try:
-                export_lie_heatmap_onnx(path)
-            except Exception:
-                return False
+            return False
         try:
             import onnxruntime as ort
 
             self._sess = ort.InferenceSession(
                 path, providers=["CPUExecutionProvider"]
             )
+            ins = self._sess.get_inputs()
+            outs = self._sess.get_outputs()
+            if ins:
+                self._input_name = ins[0].name
+            if outs:
+                self._output_name = outs[0].name
             return True
         except Exception:
             self._sess = None
             return False
 
     def reset(self, now: float = 0.0):
-        self._prev_gray = None
+        self._history.clear()
         self._belief = None
         self._active = False
         self._vel[:] = 0
@@ -281,7 +327,6 @@ class LieHeatmapTracker:
         return bool(self._opening_confirmed)
 
     def note_opening_white(self, hit: bool, now: float) -> bool:
-        """Accumulate opening white confirms. Returns True once armed for mouse."""
         if self._opening_confirmed:
             return True
         if self._opening_start_t <= 0:
@@ -319,7 +364,6 @@ class LieHeatmapTracker:
         if self._belief is None:
             belief = m.copy()
         else:
-            # Shift prior by velocity (work px)
             dx, dy = float(self._vel[0]), float(self._vel[1])
             prior = self._belief
             if abs(dx) > 0.05 or abs(dy) > 0.05:
@@ -332,14 +376,11 @@ class LieHeatmapTracker:
                     borderMode=cv2.BORDER_CONSTANT,
                     borderValue=0,
                 )
-            # Blur = diffusion
-            k = max(1, int(round(sigma)))
-            if k % 2 == 0:
-                k += 1
-            prior = cv2.GaussianBlur(prior, (k, k), sigma)
-            prior = prior + floor * (1.0 / (WORK_H * WORK_W))
+            prior = cv2.GaussianBlur(prior, (0, 0), sigmaX=float(sigma))
+            uniform = 1.0 / float(WORK_H * WORK_W)
+            prior = prior + float(floor) * uniform
             prior = prior / (float(prior.sum()) + 1e-12)
-            meas = np.power(m + 1e-12, power)
+            meas = np.power(m + 1e-12, float(power))
             meas = meas / (float(meas.sum()) + 1e-12)
             belief = (1.0 - recovery) * prior * meas + recovery * meas
             belief = belief / (float(belief.sum()) + 1e-12)
@@ -352,42 +393,64 @@ class LieHeatmapTracker:
         now: float,
         inject_xy: Optional[Tuple[float, float]] = None,
         inject_weight: float = 0.35,
+        dialog_xyxy: Optional[Tuple[int, int, int, int]] = None,
     ) -> Optional[HeatmapEstimate]:
         if not self.enable or not self._ensure_session():
             return None
-        prior = self._belief
-        feat, _work, scales, gray = build_features(
-            frame_bgr, self._prev_gray, prior
+
+        crop, ox, oy, sx, sy = extract_puzzle_crop(frame_bgr, dialog_xyxy)
+        self._crop_origin = (ox, oy, sx, sy)
+        clean = _remove_green_cursor(crop)
+        gray = prepare_gray(clean)
+        feat_u8 = gostart_build_features(
+            self._history, gray, registered_previous=registered_previous
         )
-        self._prev_gray = gray
-        sx, sy, ox, oy = scales
+        self._history.append(gray)
+        feat = feat_u8.astype(np.float32)[None, ...] / 255.0
 
         try:
-            out = self._sess.run(None, {"features": feat})[0]
+            out = self._sess.run(
+                [self._output_name], {self._input_name: feat}
+            )[0]
         except Exception:
             return None
-        logits = np.asarray(out)
-        if logits.ndim == 4:
-            logits = logits[0, 0]
-        elif logits.ndim == 3:
-            logits = logits[0]
-        meas = _softmax_map(logits)
+        meas = np.asarray(out, dtype=np.float32)
+        if meas.ndim == 3:
+            meas = meas[0]
+        elif meas.ndim == 4:
+            meas = meas[0, 0]
+        s = float(meas.sum())
+        if s > 1e-8:
+            meas = meas / s
+        else:
+            return None
 
         if inject_xy is not None:
             fx, fy = float(inject_xy[0]), float(inject_xy[1])
-            wx = (fx - ox) * sx
-            wy = (fy - oy) * sy
+            local_x = (fx - ox) / max(1e-6, sx)
+            local_y = (fy - oy) / max(1e-6, sy)
+            wx, wy = local_to_work((local_x, local_y))
             yy, xx = np.mgrid[0:WORK_H, 0:WORK_W]
-            gauss = np.exp(-0.5 * (((xx - wx) / 3.0) ** 2 + ((yy - wy) / 3.0) ** 2))
+            gauss = np.exp(
+                -0.5 * (((xx - wx) / 3.0) ** 2 + ((yy - wy) / 3.0) ** 2)
+            )
             gauss = gauss / (float(gauss.sum()) + 1e-12)
             w = float(np.clip(inject_weight, 0.0, 0.9))
             meas = (1.0 - w) * meas + w * gauss
             meas = meas / (float(meas.sum()) + 1e-12)
 
         belief = self._update_belief(meas)
-        wx, wy, conf, sec_ratio = _peak_stats(belief)
+        wx, wy = _local_centroid(belief, radius=3)
+        sec_ratio = _secondary_peak_ratio(belief, self.secondary_excl)
+        conf = _calibrated_confidence(
+            belief,
+            sec_ratio,
+            active_phase=self._active,
+            coeffs=self.calib_coeffs,
+            ambiguity_cap=self.ambiguity_cap,
+            boundary_cap=self.boundary_cap,
+        )
 
-        # Velocity estimate in work space
         if self._last_work_xy is not None:
             raw = np.array(
                 [wx - self._last_work_xy[0], wy - self._last_work_xy[1]],
@@ -402,8 +465,9 @@ class LieHeatmapTracker:
             )
         self._last_work_xy = (wx, wy)
 
-        fx = wx / max(1e-6, sx) + ox
-        fy = wy / max(1e-6, sy) + oy
+        lx, ly = work_to_local((wx, wy))
+        fx = ox + lx * sx
+        fy = oy + ly * sy
         src = "heatmap"
         if inject_xy is not None and inject_weight >= 0.5:
             src = "inject"
@@ -423,20 +487,10 @@ class LieHeatmapTracker:
             return None
         wx = self._last_work_xy[0] + float(self._vel[0]) * 0.5
         wy = self._last_work_xy[1] + float(self._vel[1]) * 0.5
-        # Map back using last estimate scale approx via last frame coords ratio
-        # Prefer last frame point + small step from last est
-        fx = self._last_est.x + float(self._vel[0]) * 0.5 * (
-            self._last_est.x / max(1.0, self._last_work_xy[0])
-        )
-        fy = self._last_est.y + float(self._vel[1]) * 0.5 * (
-            self._last_est.y / max(1.0, self._last_work_xy[1])
-        )
-        # Safer: use last frame xy + scaled vel assuming ~frame/work from last est
-        if self._last_work_xy[0] > 1 and self._last_est.x > 1:
-            sx = self._last_work_xy[0] / max(1.0, self._last_est.x)
-            sy = self._last_work_xy[1] / max(1.0, self._last_est.y)
-            fx = self._last_est.x + float(self._vel[0]) / max(1e-6, sx) * 0.4
-            fy = self._last_est.y + float(self._vel[1]) / max(1e-6, sy) * 0.4
+        ox, oy, sx, sy = self._crop_origin
+        lx, ly = work_to_local((wx, wy))
+        fx = ox + lx * sx
+        fy = oy + ly * sy
         return HeatmapEstimate(
             x=fx,
             y=fy,
@@ -452,7 +506,7 @@ class LieHeatmapTracker:
         if not self._opening_confirmed:
             return False
         if est.source == "predict":
-            return est.confidence >= self.control_min_confidence * 0.85
+            return est.confidence >= self.control_min_confidence * 0.5
         if est.secondary_ratio >= self.ambiguity_cap:
             return False
         return float(est.confidence) >= self.control_min_confidence

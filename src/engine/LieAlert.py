@@ -115,8 +115,13 @@ class LieAlert:
         self.exclude_top_ratio = float(la.get("exclude_top_ratio", 0.08))
         self.mouse_smooth = float(la.get("mouse_smooth", 0.55))
         self.mouse_takeover_px = float(la.get("mouse_takeover_px", 30.0))
-        # Short settle only; never use this to ignore a large user yank.
-        self.mouse_move_grace_s = float(la.get("mouse_move_grace_s", 0.08))
+        # After SetCursorPos: re-snap instead of yield while cursor is still settling
+        # or the game briefly rejects the move (false "user moved" at 300px+).
+        self.mouse_move_grace_s = float(la.get("mouse_move_grace_s", 0.22))
+        # Need this many consecutive far-from-command frames before permanent yield.
+        self.mouse_yield_confirm_frames = max(
+            1, int(la.get("mouse_yield_confirm_frames", 4))
+        )
         self.lose_target_grace_s = float(la.get("lose_target_grace_s", 1.2))
         self.predict_coast_s = float(la.get("predict_coast_s", 0.30))
         self.control_min_confidence = float(la.get("control_min_confidence", 0.42))
@@ -216,7 +221,8 @@ class LieAlert:
         self._mouse_stuck_log_t = 0.0
         self._mouse_fail_log_t = 0.0
         self._mouse_elev_warned = False
-        self._mouse_yielded = False  # user took the mouse; stop follow this session
+        self._mouse_yielded = False  # middle-click once → stop follow this session
+        self._middle_btn_was_down = False
         self._white_miss_since = 0.0  # wall clock of first consecutive white miss
         self._yolo_last_infer_t = 0.0
         self._yolo_last_hit = None  # cached (conf,cx,cy,bbox) between throttled runs
@@ -466,7 +472,16 @@ class LieAlert:
             la.get("mouse_takeover_px", self.mouse_takeover_px)
         )
         self.mouse_move_grace_s = float(
-            la.get("mouse_move_grace_s", getattr(self, "mouse_move_grace_s", 0.08))
+            la.get("mouse_move_grace_s", getattr(self, "mouse_move_grace_s", 0.22))
+        )
+        self.mouse_yield_confirm_frames = max(
+            1,
+            int(
+                la.get(
+                    "mouse_yield_confirm_frames",
+                    getattr(self, "mouse_yield_confirm_frames", 4),
+                )
+            ),
         )
         self.white_miss_grace_s = float(
             la.get("white_miss_grace_s", getattr(self, "white_miss_grace_s", 0.45))
@@ -1239,6 +1254,8 @@ class LieAlert:
         self._mouse_last_move_ok = False
         self._mouse_elev_warned = False
         self._mouse_yielded = False
+        self._middle_btn_was_down = False
+        self._mouse_intervene_streak = 0
         self._white_miss_since = 0.0
         self._yolo_last_infer_t = 0.0
         self._yolo_last_hit = None
@@ -1820,7 +1837,15 @@ class LieAlert:
                 inject = (float(pt[0]), float(pt[1]))
                 inj_w = 0.55 if name == "white" else 0.35
             try:
-                est = hm.push(img_bgr, now, inject_xy=inject, inject_weight=inj_w)
+                fh, fw = img_bgr.shape[:2]
+                dialog_xyxy = self._dialog_roi(fw, fh)
+                est = hm.push(
+                    img_bgr,
+                    now,
+                    inject_xy=inject,
+                    inject_weight=inj_w,
+                    dialog_xyxy=dialog_xyxy,
+                )
             except Exception:
                 est = None
             if est is not None and hm.may_move(est):
@@ -4473,99 +4498,62 @@ class LieAlert:
         self.debug_pt = None
         logger.info(f"[LieAlert] {reason}")
 
-    def _mouse_button_down(self) -> bool:
-        """True if L/R mouse button is held — clear player intervene signal."""
+    def _middle_mouse_down(self) -> bool:
+        """True while middle mouse button is held (VK_MBUTTON)."""
         try:
             import ctypes
 
-            user32 = ctypes.windll.user32
-            # VK_LBUTTON=0x01, VK_RBUTTON=0x02; high bit set while pressed
-            return bool(user32.GetAsyncKeyState(0x01) & 0x8000) or bool(
-                user32.GetAsyncKeyState(0x02) & 0x8000
-            )
+            return bool(ctypes.windll.user32.GetAsyncKeyState(0x04) & 0x8000)
         except Exception:
             return False
 
+    def _middle_mouse_pressed(self) -> bool:
+        """Rising edge: middle button went down this tick (one press to intervene)."""
+        down = self._middle_mouse_down()
+        was = bool(getattr(self, "_middle_btn_was_down", False))
+        self._middle_btn_was_down = down
+        return down and not was
+
     def _watch_user_mouse(self):
         """
-        Stop mouse-follow when the player takes over AFTER our first snap.
+        Only middle-click (press once) yields auto-follow for this dialog.
 
-        Pre-follow (intro delay): only refresh the baseline. A bump, dialog
-        focus jump, or accidental nudge must NOT abort AFK follow — that was
-        the 2026-11-03 21:19 failure (70px → permanent yield, zero snaps).
-
-        After we command the cursor: grace only ignores tiny settle jitter
-        near the commanded point. A large yank or mouse-button press yields
-        immediately — previously every-frame SetCursorPos kept us inside
-        grace forever so player intervene never fired (2026-11-06 12:22).
+        Cursor distance / L/R clicks never stop follow — those caused false
+        yields when SetCursorPos lagged or heatmap jumped (2026-11-26 337px).
+        Far-from-command still re-snaps so the bot keeps ownership of the cursor.
         """
         if self._mouse_yielded:
             return
-        # After first snap: any click = player intervene → stop fighting.
-        if self._mouse_placed_xy is not None and self._mouse_button_down():
+        # Middle-click once → player takes over (works before first snap too).
+        if self._middle_mouse_pressed():
             self._yield_to_user(
-                "user mouse button — stop auto-follow (player intervene)"
+                "middle-click — stop auto-follow (player intervene)"
             )
             return
         pos = self._cursor_pos()
         if pos is None:
             return
-        # Before first snap: keep baseline current; never permanent-yield.
+        # Before first snap: keep baseline; never yield on motion.
         if self._mouse_placed_xy is None:
-            prev = self._mouse_watch_xy
-            if prev is not None:
-                thr = max(8.0, float(self.mouse_takeover_px))
-                dist = ((pos[0] - prev[0]) ** 2 + (pos[1] - prev[1]) ** 2) ** 0.5
-                if dist >= thr:
-                    now = time.time()
-                    if now - float(getattr(self, "_pre_follow_move_log_t", 0.0) or 0.0) > 1.0:
-                        self._pre_follow_move_log_t = now
-                        logger.info(
-                            f"[LieAlert] cursor moved {dist:.0f}px during delay "
-                            f"— still auto-follow (baseline refresh)"
-                        )
             self._mouse_watch_xy = pos
             return
         thr = max(8.0, float(self.mouse_takeover_px))
         anchor = self._mouse_placed_xy
         dist_cmd = ((pos[0] - anchor[0]) ** 2 + (pos[1] - anchor[1]) ** 2) ** 0.5
         if dist_cmd < thr:
-            # Cursor is where we put it — refresh watch for next comparison.
             self._mouse_watch_xy = pos
             return
-        # Settle grace ONLY when still near commanded (OS lag / smooth).
-        # Far from commanded → fall through even if we just SetCursorPos.
-        last_move_t = float(getattr(self, "_mouse_last_move_t", 0.0) or 0.0)
-        grace = float(getattr(self, "mouse_move_grace_s", 0.08) or 0.08)
-        landed = bool(getattr(self, "_mouse_last_move_ok", False))
-        if (
-            landed
-            and last_move_t > 0.0
-            and (time.time() - last_move_t) < grace
-            and dist_cmd < thr * 1.5
-        ):
-            return
-        watch = self._mouse_watch_xy
-        if watch is not None:
-            dist_watch = ((pos[0] - watch[0]) ** 2 + (pos[1] - watch[1]) ** 2) ** 0.5
-            if dist_watch < thr:
-                # Still at the old spot: our move did not stick. Do not yield.
-                now = time.time()
-                if now - float(getattr(self, "_mouse_stuck_log_t", 0.0) or 0.0) > 1.0:
-                    self._mouse_stuck_log_t = now
-                    logger.warning(
-                        f"[LieAlert] cursor ignore our move "
-                        f"(still@({pos[0]:.0f},{pos[1]:.0f}) "
-                        f"cmd=({anchor[0]:.0f},{anchor[1]:.0f}) "
-                        f"dist={dist_cmd:.0f}px) — keep trying"
-                    )
-                    self._warn_mouse_elevation_block()
-                return
-        # Cursor left both commanded and pre-move positions → real user.
-        self._yield_to_user(
-            f"user moved the mouse — stop auto-follow "
-            f"(dist={dist_cmd:.0f}px from commanded)"
-        )
+        # Off command: re-snap only — do not yield.
+        now = time.time()
+        if now - float(getattr(self, "_mouse_stuck_log_t", 0.0) or 0.0) > 2.0:
+            self._mouse_stuck_log_t = now
+            logger.debug(
+                f"[LieAlert] cursor off command dist={dist_cmd:.0f}px — re-snap "
+                f"(middle-click to yield)"
+            )
+        self._set_cursor_screen(int(anchor[0]), int(anchor[1]))
+        self._mouse_last_move_t = now
+        self._mouse_last_move_ok = False
 
     def _frame_to_screen(self, pt, capture):
         """Map frame (x,y) → absolute screen coords using capturor region."""
@@ -4661,12 +4649,6 @@ class LieAlert:
 
     def _move_mouse_to_frame_point(self, pt, capture):
         if self._mouse_yielded:
-            return
-        # Last chance: if player already yanked/clicked, do not fight this frame.
-        if self._mouse_placed_xy is not None and self._mouse_button_down():
-            self._yield_to_user(
-                "user mouse button — stop auto-follow (player intervene)"
-            )
             return
         self._warn_mouse_elevation_block(capture)
         sx, sy = self._frame_to_screen(pt, capture)
