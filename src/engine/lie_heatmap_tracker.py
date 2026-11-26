@@ -31,6 +31,8 @@ from src.engine.gostart_lie_features import (
 
 CROP_W = 752
 CROP_H = 501
+# gostart tracker.PUZZLE_IMAGE_CROP_OFFSETS relative to title top-left
+PUZZLE_FROM_TITLE = (3, 27, 755, 528)  # left, top, right, bottom deltas
 DEFAULT_MODEL = "assets/lie_detector/lie-detector-observation.onnx"
 DEFAULT_META = "assets/lie_detector/lie-detector-observation.json"
 
@@ -57,16 +59,43 @@ def _remove_green_cursor(bgr: np.ndarray) -> np.ndarray:
     return out
 
 
+def puzzle_rect_from_title(
+    title_tl: Tuple[int, int],
+    frame_w: int,
+    frame_h: int,
+) -> Optional[Tuple[int, int, int, int]]:
+    """Exact gostart 752×501 puzzle rect from dialog title top-left."""
+    tx, ty = int(title_tl[0]), int(title_tl[1])
+    dl, dt, dr, db = PUZZLE_FROM_TITLE
+    x0, y0, x1, y1 = tx + dl, ty + dt, tx + dr, ty + db
+    if x1 - x0 != CROP_W or y1 - y0 != CROP_H:
+        return None
+    if x0 < 0 or y0 < 0 or x1 > frame_w or y1 > frame_h:
+        return None
+    return (x0, y0, x1, y1)
+
+
 def extract_puzzle_crop(
     frame_bgr: np.ndarray,
     dialog_xyxy: Optional[Tuple[int, int, int, int]] = None,
+    title_tl: Optional[Tuple[int, int]] = None,
 ) -> Tuple[np.ndarray, float, float, float, float]:
     """
     Return (crop752x501, ox, oy, sx, sy) mapping crop-local → frame:
       frame_x = ox + local_x * sx
       frame_y = oy + local_y * sy
+
+    Prefer gostart title→puzzle offsets when `title_tl` is known.
     """
     fh, fw = frame_bgr.shape[:2]
+    if title_tl is not None:
+        rect = puzzle_rect_from_title(title_tl, fw, fh)
+        if rect is not None:
+            x0, y0, x1, y1 = rect
+            crop = frame_bgr[y0:y1, x0:x1]
+            if crop.shape[0] == CROP_H and crop.shape[1] == CROP_W:
+                return crop, float(x0), float(y0), 1.0, 1.0
+
     if dialog_xyxy is None:
         x0, y0 = int(fw * 0.22), int(fh * 0.22)
         x1, y1 = int(fw * 0.78), int(fh * 0.78)
@@ -213,6 +242,11 @@ class LieHeatmapTracker:
         self.velocity_gain = 1.0
         self.velocity_momentum = 0.5
         self.velocity_max_work_px = 10.0
+        # gostart tracking_safety (crop-local px)
+        self.innovation_gate_base_px = 20.0
+        self.innovation_gate_speed_px_s = 180.0
+        self.innovation_gate_max_dt_s = 0.35
+        self.observation_min_confidence = 0.60
         self.calib_coeffs = {
             "intercept": -0.1727907,
             "normalized_heatmap_concentration": 1.84598363,
@@ -230,11 +264,14 @@ class LieHeatmapTracker:
         self._active = False
         self._vel = np.zeros(2, dtype=np.float32)
         self._last_work_xy = None
+        self._last_local_xy = None  # crop-local accepted track
+        self._last_push_t = 0.0
         self._opening_hits = 0
         self._opening_confirmed = False
         self._opening_start_t = 0.0
         self._last_est: Optional[HeatmapEstimate] = None
         self._crop_origin = (0.0, 0.0, 1.0, 1.0)  # ox, oy, sx, sy
+        self._crop_mode = "roi"  # title | roi
 
         if self.enable:
             self._ensure_session()
@@ -287,6 +324,10 @@ class LieHeatmapTracker:
             )
         )
         self.boundary_cap = float(cal.get("boundary_confidence_cap", self.boundary_cap))
+        safety = meta.get("tracking_safety") or {}
+        # JSON uses a string formula; keep numeric defaults unless overridden in lie_alert.
+        if "held_out_normal_motion_coverage" in safety:
+            pass  # informational only
 
     def _ensure_session(self) -> bool:
         if self._sess is not None:
@@ -317,10 +358,13 @@ class LieHeatmapTracker:
         self._active = False
         self._vel[:] = 0
         self._last_work_xy = None
+        self._last_local_xy = None
+        self._last_push_t = 0.0
         self._opening_hits = 0
         self._opening_confirmed = False
         self._opening_start_t = float(now or 0.0)
         self._last_est = None
+        self._crop_mode = "roi"
 
     @property
     def opening_confirmed(self) -> bool:
@@ -387,6 +431,12 @@ class LieHeatmapTracker:
         self._belief = belief
         return belief
 
+    def _innovation_gate_px(self, delta_s: float) -> float:
+        dt = min(max(0.0, float(delta_s)), float(self.innovation_gate_max_dt_s))
+        return float(self.innovation_gate_base_px) + float(
+            self.innovation_gate_speed_px_s
+        ) * dt
+
     def push(
         self,
         frame_bgr: np.ndarray,
@@ -394,12 +444,16 @@ class LieHeatmapTracker:
         inject_xy: Optional[Tuple[float, float]] = None,
         inject_weight: float = 0.35,
         dialog_xyxy: Optional[Tuple[int, int, int, int]] = None,
+        title_tl: Optional[Tuple[int, int]] = None,
     ) -> Optional[HeatmapEstimate]:
         if not self.enable or not self._ensure_session():
             return None
 
-        crop, ox, oy, sx, sy = extract_puzzle_crop(frame_bgr, dialog_xyxy)
+        crop, ox, oy, sx, sy = extract_puzzle_crop(
+            frame_bgr, dialog_xyxy=dialog_xyxy, title_tl=title_tl
+        )
         self._crop_origin = (ox, oy, sx, sy)
+        self._crop_mode = "title" if title_tl is not None else "roi"
         clean = _remove_green_cursor(crop)
         gray = prepare_gray(clean)
         feat_u8 = gostart_build_features(
@@ -439,7 +493,51 @@ class LieHeatmapTracker:
             meas = (1.0 - w) * meas + w * gauss
             meas = meas / (float(meas.sum()) + 1e-12)
 
-        belief = self._update_belief(meas)
+        # Peak of raw measurement (before belief) for innovation gate
+        meas_wx, meas_wy = _local_centroid(meas, radius=3)
+        meas_lx, meas_ly = work_to_local((meas_wx, meas_wy))
+        dt = 0.05
+        if self._last_push_t > 0:
+            dt = max(0.0, float(now) - float(self._last_push_t))
+        accept_obs = True
+        if self._last_local_xy is not None:
+            prev_lx, prev_ly = self._last_local_xy
+            innov = float(
+                ((meas_lx - prev_lx) ** 2 + (meas_ly - prev_ly) ** 2) ** 0.5
+            )
+            gate = self._innovation_gate_px(dt)
+            raw_sec = _secondary_peak_ratio(meas, self.secondary_excl)
+            raw_conf = _calibrated_confidence(
+                meas,
+                raw_sec,
+                active_phase=self._active,
+                coeffs=self.calib_coeffs,
+                ambiguity_cap=self.ambiguity_cap,
+                boundary_cap=self.boundary_cap,
+            )
+            if innov > gate or raw_conf < float(self.observation_min_confidence):
+                accept_obs = False
+        if accept_obs or self._belief is None:
+            belief = self._update_belief(meas)
+        else:
+            # Reject observation: coast belief with velocity only.
+            prior = self._belief
+            if abs(float(self._vel[0])) > 0.05 or abs(float(self._vel[1])) > 0.05:
+                M = np.float32(
+                    [[1, 0, float(self._vel[0])], [0, 1, float(self._vel[1])]]
+                )
+                prior = cv2.warpAffine(
+                    prior,
+                    M,
+                    (WORK_W, WORK_H),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0,
+                )
+                prior = prior / (float(prior.sum()) + 1e-12)
+                self._belief = prior
+            belief = self._belief
+
         wx, wy = _local_centroid(belief, radius=3)
         sec_ratio = _secondary_peak_ratio(belief, self.secondary_excl)
         conf = _calibrated_confidence(
@@ -466,15 +564,19 @@ class LieHeatmapTracker:
         self._last_work_xy = (wx, wy)
 
         lx, ly = work_to_local((wx, wy))
+        if accept_obs:
+            self._last_local_xy = (lx, ly)
+        self._last_push_t = float(now)
+
         fx = ox + lx * sx
         fy = oy + ly * sy
-        src = "heatmap"
-        if inject_xy is not None and inject_weight >= 0.5:
+        src = "heatmap" if accept_obs else "predict"
+        if accept_obs and inject_xy is not None and inject_weight >= 0.5:
             src = "inject"
         est = HeatmapEstimate(
             x=fx,
             y=fy,
-            confidence=conf,
+            confidence=conf if accept_obs else max(0.0, conf * 0.85),
             secondary_ratio=sec_ratio,
             source=src,
             work_xy=(wx, wy),

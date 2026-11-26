@@ -190,6 +190,7 @@ class LieAlert:
         self._last_score = 1.0
         self._last_hit = ""
         self._hold_until = 0.0
+        self._lie_title_tl = None  # frame (x,y) dialog title top-left for puzzle crop
         self._dialog_miss = 0  # consecutive detect ticks without dialog confirm
         self.visible = False
         self.following = False
@@ -1256,6 +1257,7 @@ class LieAlert:
         self._mouse_yielded = False
         self._middle_btn_was_down = False
         self._mouse_intervene_streak = 0
+        self._title_tl_refresh_i = 0
         self._white_miss_since = 0.0
         self._yolo_last_infer_t = 0.0
         self._yolo_last_hit = None
@@ -1372,17 +1374,20 @@ class LieAlert:
         """Return (found, hit_str, is_cn_title).
 
         Cheap title templates first; large intro banner/body only if those miss.
+        On hit, stores frame-space title top-left in `_lie_title_tl` for puzzle crop.
         """
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
         fh, fw = gray.shape[:2]
-        roi, _ = self._center_roi(gray)
-        band, _ = self._dialog_band(gray)
+        roi, roi_box = self._center_roi(gray)
+        rx0, ry0 = int(roi_box[0]), int(roi_box[1])
+        band, (bx0, by0) = self._dialog_band(gray)
         best_pass_score = 1.0
         best_pass_path = ""
+        best_pass_tl = None
         best_any_score = 1.0
 
         def _scan(items):
-            nonlocal best_pass_score, best_pass_path, best_any_score
+            nonlocal best_pass_score, best_pass_path, best_pass_tl, best_any_score
             for path, tmpl in items:
                 th, tw = tmpl.shape[:2]
                 if tw >= fw or th >= fh:
@@ -1391,13 +1396,17 @@ class LieAlert:
                 # so sky/cloud patches cannot trip the alarm.
                 if self._is_intro_template(path):
                     search = band
+                    ox, oy = bx0, by0
                 else:
                     search = roi
+                    ox, oy = rx0, ry0
                 if search.shape[0] <= th or search.shape[1] <= tw:
                     search = gray
+                    ox, oy = 0, 0
                 try:
                     res = cv2.matchTemplate(search, tmpl, cv2.TM_SQDIFF_NORMED)
-                    min_val = float(np.nanmin(res))
+                    min_val, _, min_loc, _ = cv2.minMaxLoc(res)
+                    min_val = float(min_val)
                 except Exception:
                     continue
                 if not np.isfinite(min_val):
@@ -1408,6 +1417,9 @@ class LieAlert:
                 if min_val <= thr and min_val < best_pass_score:
                     best_pass_score = min_val
                     best_pass_path = path
+                    # Puzzle crop offsets are relative to interactive title, not intro banner.
+                    if not self._is_intro_template(path):
+                        best_pass_tl = (int(ox + min_loc[0]), int(oy + min_loc[1]))
 
         cheap = [(p, t) for p, t in self._tmpl_list if not self._is_intro_template(p)]
         intro = [(p, t) for p, t in self._tmpl_list if self._is_intro_template(p)]
@@ -1416,6 +1428,8 @@ class LieAlert:
             _scan(intro)
         if best_pass_path:
             self._last_score = best_pass_score
+            if best_pass_tl is not None:
+                self._lie_title_tl = best_pass_tl
             return (
                 True,
                 f"tmpl:{os.path.basename(best_pass_path)}",
@@ -1839,12 +1853,21 @@ class LieAlert:
             try:
                 fh, fw = img_bgr.shape[:2]
                 dialog_xyxy = self._dialog_roi(fw, fh)
+                # Refresh title TL occasionally so puzzle crop stays gostart-aligned.
+                title_tl = getattr(self, "_lie_title_tl", None)
+                if (int(getattr(self, "_title_tl_refresh_i", 0) or 0) % 8) == 0:
+                    self._match_templates(img_bgr)
+                    title_tl = getattr(self, "_lie_title_tl", None)
+                self._title_tl_refresh_i = int(
+                    getattr(self, "_title_tl_refresh_i", 0) or 0
+                ) + 1
                 est = hm.push(
                     img_bgr,
                     now,
                     inject_xy=inject,
                     inject_weight=inj_w,
                     dialog_xyxy=dialog_xyxy,
+                    title_tl=title_tl,
                 )
             except Exception:
                 est = None
