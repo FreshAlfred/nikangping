@@ -1525,6 +1525,34 @@ class MonsterDetector:
         return (int(round(best["x"])), int(round(best["y"])))
 
 
+    def _scale_minimap_box(self, box, mm_cfg):
+        """Scale the configured minimap box from its reference client size.
+
+        The HUD scales with the MapleStory window, so a box measured at
+        1920x1080 has to be rescaled when the client runs at another size.
+        Without ref_width/ref_height the box is used as-is (old behaviour).
+        """
+        try:
+            ref_w = float(mm_cfg.get("ref_width", 0) or 0)
+            ref_h = float(mm_cfg.get("ref_height", 0) or 0)
+        except (TypeError, ValueError):
+            return box
+        if ref_w <= 0 or ref_h <= 0 or self.img_frame is None:
+            return box
+        fh, fw = self.img_frame.shape[:2]
+        if fw <= 0 or fh <= 0:
+            return box
+        sx, sy = float(fw) / ref_w, float(fh) / ref_h
+        if abs(sx - 1.0) < 0.01 and abs(sy - 1.0) < 0.01:
+            return box
+        x, y, w, h = box
+        return (
+            int(round(x * sx)),
+            int(round(y * sy)),
+            max(8, int(round(w * sx))),
+            max(8, int(round(h * sy))),
+        )
+
     def _detect_minimap(self):
         """
         Prefer fixed config minimap (flash_patrol). Full-frame white-border
@@ -1545,19 +1573,38 @@ class MonsterDetector:
         cached = getattr(self, "_minimap_cached", None)
         last_t = float(getattr(self, "_minimap_auto_t", 0.0) or 0.0)
 
-        # Fast path: trust config / cache between rare auto refreshes.
-        if cfg_box is not None and (auto_every <= 0 or (now - last_t) < auto_every):
-            return cached or cfg_box
+        # Config box was measured at ref_width/ref_height; rescale for this client.
+        if cfg_box is not None:
+            cfg_box = self._scale_minimap_box(cfg_box, mm_cfg)
+
+        # Fast path: trust cache between rare auto refreshes. 第一次（还没有 cache）
+        # 一定要跑一次自动探测：小地图面板的高度是随地图变的（遗迹之墓1 是 85，
+        # 云彩公园4 是 131），用固定框会把下面的玩家黄点裁掉、锁到标题栏的金色图标上。
+        if (
+            cfg_box is not None
+            and cached is not None
+            and (auto_every <= 0 or (now - last_t) < auto_every)
+        ):
+            return cached
 
         self._minimap_auto_t = now
         result = get_minimap_loc_size(self.img_frame)
         if result:
             x, y, w_m, h_m = result
-            if self.frame_count == 1:
-                logger.info(f"[Minimap] Auto-detected: ({x},{y}) {w_m}x{h_m}")
+            logger.info(
+                f"[Minimap] Auto-detected: ({x},{y}) {w_m}x{h_m}"
+                + (f" (config fallback {cfg_box})" if cfg_box and self.frame_count <= 30 else "")
+            )
             x_i, y_i, w_i, h_i = (x + 1, y + 1, w_m - 2, h_m - 2)
             if w_i > 0 and h_i > 0:
-                self._minimap_cached = (x_i, y_i, w_i, h_i)
+                new_box = (x_i, y_i, w_i, h_i)
+                if self._minimap_cached != new_box:
+                    # 框换了（换地图 / 面板高度变了）：旧黄点坐标作废，
+                    # 否则会出现 y=114 而 ROI 只有 85 这种错位。
+                    self.loc_player_minimap = None
+                    self._hunt_smooth_x = None
+                    self._hunt_smooth_y = None
+                self._minimap_cached = new_box
                 return self._minimap_cached
 
         if cfg_box is not None:
@@ -2170,8 +2217,108 @@ class MonsterDetector:
             self._hunt_smooth_y = (1.0 - alpha) * self._hunt_smooth_y + alpha * raw_y
         return float(self._hunt_smooth_y)
 
+    def _try_bottom_drop(self, py, mh, da, band_ratio):
+        """回到最底层：短暂「↓+跳」穿平台，而不是一直按住 ↓。
+
+        带退避：bottom_drop_timeout_s 内黄点 Y 没继续往下走（已经到底、或这张图
+        不能穿平台），就停手 bottom_drop_retry_s，让巡逻 + 攻击照常跑。
+        """
+        now = time.time()
+        retry_s = float(da.get("bottom_drop_retry_s", 20.0))
+        if now < float(getattr(self, "_bottom_drop_pause_until", 0.0) or 0.0):
+            return
+        start_y = getattr(self, "_bottom_drop_start_y", None)
+        if start_y is None:
+            self._bottom_drop_start_y = float(py)
+            self._bottom_drop_start_t = now
+        else:
+            delta = float(da.get("bottom_drop_min_delta_px", 3.0))
+            if float(py) - float(start_y) >= delta:
+                # 往下走了一层：重新开始计时
+                self._bottom_drop_start_y = float(py)
+                self._bottom_drop_start_t = now
+            elif now - float(getattr(self, "_bottom_drop_start_t", now)) >= float(
+                da.get("bottom_drop_timeout_s", 3.0)
+            ):
+                self._bottom_drop_start_y = None
+                self._bottom_drop_start_t = 0.0
+                self._bottom_drop_pause_until = now + retry_s
+                logger.info(
+                    f"[Patrol] bottom drop 放弃：y={py:.0f}/{mh:.0f} 没往下走，"
+                    f"先正常巡逻 {retry_s:.0f}s"
+                )
+                return
+
+        drop_key = str(da.get("bottom_drop_jump_key", "") or "").strip()
+        kb = getattr(self, "_kb", None)
+        if not drop_key or kb is None:
+            return
+        interval = max(0.2, float(da.get("bottom_drop_interval_s", 0.8)))
+        if now - float(getattr(self, "_t_last_bottom_drop", 0.0) or 0.0) < interval:
+            return
+        try:
+            ok = kb.drop_through_platform(drop_key)
+        except Exception:
+            return
+        self._t_last_bottom_drop = now
+        if ok and now - float(getattr(self, "_t_last_bottom_drop_log", 0.0) or 0.0) >= 5.0:
+            self._t_last_bottom_drop_log = now
+            logger.info(
+                f"[Patrol] bottom drop ↓+{drop_key} y={py:.0f}/{mh:.0f} "
+                f"band={band_ratio * mh:.0f}"
+            )
+
+    def _apply_pending_flip_teleport(self):
+        """掉头后补一次瞬移：等转向生效再按，按完清标记；带冷却防连按。
+
+        配置：directional_attack.flip_teleport_key（空=关闭，F4 用 "x"）。
+        """
+        due = float(getattr(self, "_flip_teleport_at", 0.0) or 0.0)
+        if due <= 0.0:
+            return
+        now = time.time()
+        if now < due:
+            return
+        self._flip_teleport_at = 0.0
+        da = self.cfg.get("directional_attack") or {}
+        key = str(da.get("flip_teleport_key", "") or "").strip()
+        kb = getattr(self, "_kb", None)
+        if not key or kb is None:
+            return
+        cd = float(da.get("flip_teleport_cooldown_s", 1.0) or 0.0)
+        last = float(getattr(self, "_t_last_flip_teleport", 0.0) or 0.0)
+        if cd > 0 and (now - last) < cd:
+            return
+        # 别在治愈术/技能宏的施法动作里按瞬移：那段时间按下去会被吞。
+        # 等这一发动作过去（最多多等 ~1.5s，由外层反复调用重试）。
+        aoe_cfg = self.cfg.get("aoe_skill") or {}
+        hold_s = float(aoe_cfg.get("press_duration", 0.05) or 0.05)
+        busy_after = float(da.get("flip_teleport_wait_after_attack_s", 0.35) or 0.0)
+        last_attack = float(getattr(self, "_t_last_attack", 0.0) or 0.0)
+        if last_attack > 0 and (now - last_attack) < (hold_s + busy_after):
+            self._flip_teleport_at = now + 0.05
+            return
+        press_s = float(da.get("flip_teleport_press_s", 0.12) or 0.12)
+        # 把巡逻方向显式传下去：法师瞬移必须按住方向键才飞，
+        # 而 cmd_left_right 在小段停顿时是 none（那时只按 X 不会动）。
+        want_dir = self._hunt_search_dir if self._hunt_search_dir in ("left", "right") else None
+        try:
+            if hasattr(kb, "teleport_in_dir"):
+                ok = kb.teleport_in_dir(key, press_s, direction=want_dir)
+            else:
+                ok = kb.tap_key(key, press_s)
+        except Exception:
+            return
+        if ok:
+            self._t_last_flip_teleport = now
+            logger.info(
+                f"[Patrol] flip teleport '{key}' dir={self._hunt_search_dir}"
+                + ("" if want_dir else "（无方向）")
+            )
+
     def _get_hunt_search_command(self):
         """Return (move_x, move_y, action) for left/right sweeping while searching monsters."""
+        self._apply_pending_flip_teleport()
         cfg = self.cfg.get("directional_attack", {})
         if not bool(cfg.get("search_enabled", True)):
             return "none", "none", "none"
@@ -2663,9 +2810,84 @@ class MonsterDetector:
             # Edge-only: never schedule or fire timer flips.
             self._hunt_search_flip_frame = 0
 
+        # 每一趟走多久：F4/F5 用「随机小距离」模式（search_leg_min/max_seconds）。
+        #   - search_leg_keep_dir=true：小段走完「不回头」，停一下继续同方向，
+        #     所以仍然是完整巡逻（会一路扫到左右边缘才掉头+瞬移），只是步子碎。
+        #   - search_leg_keep_dir=false（默认）：每小段都掉头，只在原地附近晃。
+        # 只给 search_max_leg_seconds 时退化成固定上限（F1/F2/F3 都是 0 = 只认边缘）。
+        leg_min = max(0.0, float(cfg.get("search_leg_min_seconds", 0) or 0))
+        leg_max = max(0.0, float(cfg.get("search_leg_max_seconds", 0) or 0))
+        random_legs = leg_min > 0.0 and leg_max >= leg_min
+        leg_target = 0.0
+        leg_reason = "leg_timeout"
+        if random_legs:
+            import random as _random
+            leg_target = float(getattr(self, "_hunt_leg_target_s", 0.0) or 0.0)
+            if leg_target <= 0.0:
+                leg_target = (
+                    _random.uniform(leg_min, leg_max) if leg_max > leg_min else leg_min
+                )
+                self._hunt_leg_target_s = leg_target
+            leg_reason = "leg_random"
+        else:
+            leg_target = max(0.0, float(cfg.get("search_max_leg_seconds", 0) or 0))
+        if flip_reason is None and flash_patrol and leg_target > 0:
+            now_leg = time.time()
+            leg_t0 = float(getattr(self, "_hunt_leg_t0", 0.0) or 0.0)
+            if leg_t0 <= 0.0:
+                self._hunt_leg_t0 = now_leg
+                if float(getattr(self, "_hunt_sweep_t0", 0.0) or 0.0) <= 0.0:
+                    self._hunt_sweep_t0 = now_leg
+            elif (now_leg - leg_t0) >= leg_target:
+                keep_dir = bool(cfg.get("search_leg_keep_dir", False)) and random_legs
+                sweep_cap = float(cfg.get("search_max_leg_seconds", 0) or 0)
+                sweep_t0 = float(getattr(self, "_hunt_sweep_t0", 0.0) or 0.0) or leg_t0
+                if keep_dir and (sweep_cap <= 0 or (now_leg - sweep_t0) < sweep_cap):
+                    # 随机小段走完：不回头，停一下继续同方向（仍然扫到边缘）
+                    self._hunt_leg_t0 = now_leg
+                    self._hunt_leg_target_s = 0.0
+                    pause_s = max(0.0, float(cfg.get("search_leg_pause_s", 0.0) or 0.0))
+                    # 停顿也随机一点，别走成节拍器
+                    pj = min(0.9, max(0.0, float(cfg.get("search_leg_pause_jitter", 0.0) or 0.0)))
+                    if pause_s > 0 and pj > 0:
+                        pause_s = _random.uniform(
+                            pause_s * (1.0 - pj), pause_s * (1.0 + pj)
+                        )
+                    if pause_s > 0:
+                        self._hunt_leg_pause_until = now_leg + pause_s
+                    logger.info(
+                        f"[Patrol] leg burst {leg_target:.2f}s → 停 {pause_s:.2f}s 继续 "
+                        f"{self._hunt_search_dir}（未到边缘不回头）"
+                    )
+                else:
+                    flip_reason = leg_reason
+                    logger.info(
+                        f"[Patrol] {leg_reason} {leg_target:.2f}s "
+                        f"(dir={self._hunt_search_dir}) → 掉头"
+                    )
+
+        # 黄点卡死兜底：不管是因为顶墙、还是 ROI 裁错锁到静态图标上，只要
+        # 「一直在走、但 x 连续 search_dot_stall_s 秒完全不动」就强制掉头。
+        # 这样即使小地图识别失灵也不会一直往墙里走。
+        stall_s = float(cfg.get("search_dot_stall_s", 0) or 0)
+        if flip_reason is None and flash_patrol and stall_s > 0 and progress_x is not None:
+            now_s = time.time()
+            last_x = getattr(self, "_dot_stall_x", None)
+            if last_x is None or abs(float(progress_x) - float(last_x)) >= 1.0:
+                self._dot_stall_x = float(progress_x)
+                self._dot_stall_t = now_s
+            elif (now_s - float(getattr(self, "_dot_stall_t", now_s))) >= stall_s:
+                flip_reason = "dot_stall"
+                logger.info(
+                    f"[Patrol] dot stall {stall_s:.1f}s x={progress_x:.1f} "
+                    f"(dir={self._hunt_search_dir}) → 掉头"
+                )
+
         if flip_reason is not None:
-            # Mid-zone already set _hunt_search_dir; other reasons still toggle.
-            if not getattr(self, "_hunt_dir_forced", False):
+            # Mid-zone / edge branches already set _hunt_search_dir themselves;
+            # a generic flip (leg timeout, stall) still has to toggle it.
+            already_turned = bool(getattr(self, "_hunt_dir_forced", False))
+            if not already_turned:
                 self._hunt_search_dir = "right" if self._hunt_search_dir == "left" else "left"
             self._hunt_dir_forced = False
             self._hunt_dir_change_frame = self.frame_count
@@ -2675,6 +2897,28 @@ class MonsterDetector:
             self._hunt_search_sweeps += 1
             self._hunt_search_stall_frames = 0
             self._hunt_search_last_reason = flip_reason
+            self._hunt_leg_t0 = time.time()
+            self._hunt_sweep_t0 = self._hunt_leg_t0
+            # 下一趟重新抽一个随机时长（随机小距离模式）
+            self._hunt_leg_target_s = 0.0
+            self._dot_stall_x = None
+            # Generic flips do not go through _patrol_force_dir(), so re-hold the
+            # new arrow here — otherwise the character keeps facing the old way
+            # for a few frames and the flip teleport flies the wrong direction.
+            if not already_turned:
+                kb_flip = getattr(self, "_kb", None)
+                if kb_flip is not None and hasattr(kb_flip, "request_dir_override"):
+                    try:
+                        kb_flip.request_dir_override(self._hunt_search_dir)
+                    except Exception:
+                        pass
+            # 掉头后加一次瞬移：先等角色真的转过来（默认 0.18s）再按，
+            # 否则瞬移还是朝旧方向。由 _apply_pending_flip_teleport() 执行。
+            tp_key = str(cfg.get("flip_teleport_key", "") or "").strip()
+            if tp_key:
+                self._flip_teleport_at = time.time() + max(
+                    0.0, float(cfg.get("flip_teleport_delay_s", 0.18))
+                )
             if progress_x is not None:
                 self._hunt_search_anchor_x = progress_x
                 self._hunt_search_last_progress_x = progress_x
@@ -2921,7 +3165,7 @@ class MonsterDetector:
         prof = getattr(self._kb, "_active_profile", None) if self._kb else None
         kb_on = bool(self._kb and self._kb.is_enable)
         texts += [
-            f"S=shot Q=quit | F1=12139 F2=12138 F3=station | "
+            f"S=shot Q=quit | F1=12139 F2=12138 F3=station F4=priest F5=gunner | "
             f"KB:{'ON' if kb_on else 'IDLE'} prof:{prof or '-'}"
         ]
         if prof == "f3" and self._station_center_x is not None:
@@ -3289,15 +3533,21 @@ class MonsterDetector:
                     patrol_x, patrol_y, _patrol_action = self._get_hunt_search_command()
                     move_x = patrol_x if patrol_x in ("left", "right") else self._hunt_search_dir
                     move_y = "none"
-                    # Bottom-floor band (yellow-dot Y): if above bottom platform, hold Down
-                    # so jump (S) drops through pads back to the ground strip.
+                    # 随机小段之间的短暂停顿：站着打一下，然后继续同方向走
+                    if time.time() < float(getattr(self, "_hunt_leg_pause_until", 0.0) or 0.0):
+                        move_x = "none"
+                    # Bottom-floor band (yellow-dot Y): 人在底层带以上就补一次「↓+跳」穿平台。
+                    # 注意不能把 ↓ 挂在 move_y 上常按——冒险岛里按住 ↓ 是蹲下，人物不走，
+                    # 巡逻就永远到不了左右边缘（F4 首轮实测卡死就是这个原因）。
                     da = self.cfg.get("directional_attack", {}) or {}
                     bot_ymin = da.get("search_bottom_y_min_ratio", None)
                     if bot_ymin is not None and self.img_minimap is not None:
                         py = self._get_hunt_search_progress_y()
                         mh = float(self.img_minimap.shape[0])
                         if py is not None and mh > 0 and py < float(bot_ymin) * mh:
-                            move_y = "down"
+                            self._try_bottom_drop(py, mh, da, float(bot_ymin))
+                        else:
+                            self._bottom_drop_start_y = None
                     action = "aoe"
                     # Mark chase_active so walk_teleport flashes Z while holding left/right
                     self._kb._chase_active = True if move_x in ("left", "right") else False

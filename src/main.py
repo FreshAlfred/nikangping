@@ -29,6 +29,18 @@ from src.utils.common import load_yaml, override_cfg, is_mac
 from src.engine.MonsterDetector import MonsterDetector
 
 
+def merge_config_files(cfg_path: str, custom_cfg_path: str) -> dict:
+    """default → （macOS）→ custom 三层合并；启动和 F12 热加载共用。"""
+    merged = load_yaml(cfg_path)
+    if is_mac():
+        mac_path = "config/config_macOS.yaml"
+        if os.path.exists(mac_path):
+            merged = override_cfg(merged, load_yaml(mac_path))
+    if custom_cfg_path and os.path.exists(custom_cfg_path):
+        merged = override_cfg(merged, load_yaml(custom_cfg_path))
+    return merged
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="MapleStoryGo — Monster Detection System"
@@ -77,6 +89,41 @@ def main():
     else:
         logger.info(f"  No custom config found at {custom_cfg_path}")
 
+    _reload_state = {"t": 0.0}
+
+    def reload_config() -> bool:
+        """F12: 原地重新读一遍配置文件（不重启进程）。
+
+        直接改 cfg 的内容而不是换对象——KB / detector 都持有同一个 dict 引用，
+        原地更新它们立刻就看到新值。之后再把当前挂机 profile 重新合并一遍，
+        让 profiles.<id> 的覆盖重新生效。
+        """
+        now = time.time()
+        if now - _reload_state["t"] < 1.0:      # pynput + 轮询会各触发一次
+            return False
+        _reload_state["t"] = now
+        try:
+            new_cfg = merge_config_files(cfg_path, custom_cfg_path)
+            # 保持运行时的窗口开关状态，不被文件里的 disable_viz 顶掉
+            new_cfg["disable_viz"] = not bool(getattr(detector, "is_show_debug", False))
+            cfg.clear()
+            cfg.update(new_cfg)
+            prof = getattr(kb, "_active_profile", None)
+            if prof:
+                kb.apply_profile(prof)
+            logger.info(
+                f"[Config] 已重新加载 {custom_cfg_path}"
+                + (f"（profile={prof} 已重新合并）" if prof else "")
+            )
+            logger.info(
+                "[Config] 注意：测谎模板/阈值、health_monitor 血条参数、怪物素材"
+                "是启动时读的，这些仍要重启才生效"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"[Config] 重新加载失败: {e}")
+            return False
+
     if args.enable_viz:
         cfg["disable_viz"] = False
         logger.info("  Debug visualization: enabled (--enable_viz)")
@@ -102,20 +149,24 @@ def main():
         logger.info(f"Loading map/route: {cfg['bot']['map']}...")
         detector.load_map_and_routes(cfg["bot"]["map"])
 
-    # Create keyboard controller for movement + listener for F1/F2/F3 profiles
+    # Create keyboard controller for movement + listener for F1–F5 profiles
     from src.input.KeyBoardController import KeyBoardController
     from src.input.KeyBoardListener import KeyBoardListener
     kb = KeyBoardController(cfg)
     detector._kb = kb  # Wire to detector
     kb.set_detector(detector)
+    kb.set_reload_callback(reload_config)   # F12（轮询路径，游戏吞 pynput 也能用）
     kb_listener = KeyBoardListener(cfg, is_autobot=True)
-    # F1=12139 小地图黄点边缘巡逻；F2=12138 中区；F3=定点；同键再按关闭
+    # F1=12139 边缘巡逻；F2=12138 中区；F3=定点；F4=牧师底层治愈；F5=火枪手底层清怪
     kb_listener.register_func_key_handler('f1', lambda: kb.start_profile("f1"))
     kb_listener.register_func_key_handler('f2', lambda: kb.start_profile("f2"))
     kb_listener.register_func_key_handler('f3', lambda: kb.start_profile("f3"))
+    kb_listener.register_func_key_handler('f4', lambda: kb.start_profile("f4"))
+    kb_listener.register_func_key_handler('f5', lambda: kb.start_profile("f5"))
     logger.info(
         "Hotkeys: F1=12139黄点边缘巡逻(A 0.5-0.75s)  F2=12138中区(S+A)  "
-        "F3=12139定点站桩  同键再按=停止  F11=detect/hunt"
+        "F3=12139定点站桩  F4=牧师底层治愈巡逻(A)  F5=火枪手云彩公园4底层清怪(A)  "
+        "同键再按=停止  F11=detect/hunt"
     )
 
     logger.info("Starting game window capture...")
@@ -154,7 +205,11 @@ def main():
                 pass
 
     kb_listener.register_func_key_handler('f10', _toggle_viz)
-    logger.info("Hotkeys: F10=toggle monitor window  F11=detect/hunt")
+    # F12: 改完 config/config_custom.yaml 不用重启，按一下重新加载
+    kb_listener.register_func_key_handler('f12', reload_config)
+    logger.info(
+        "Hotkeys: F10=toggle monitor window  F11=detect/hunt  F12=重新加载配置"
+    )
 
     # -------------------------------------------------------------------
     # Main thread: display loop (matches reference: main() while loop)

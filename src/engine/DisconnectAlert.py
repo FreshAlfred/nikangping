@@ -344,6 +344,16 @@ class DisconnectAlert:
     def _normalize_ocr_text(s: str) -> str:
         return "".join(ch for ch in str(s).upper() if not ch.isspace())
 
+    def _suppress_ocr_keywords(self):
+        """OCR 关键词抑制表（商城等非游戏画面），返回已归一化的词。"""
+        raw = (self.cfg.get("disconnect_alert") or {}).get("suppress_keywords") or []
+        out = []
+        for k in raw:
+            nk = self._normalize_ocr_text(k)
+            if nk:
+                out.append(nk)
+        return out
+
     def _match_ocr(self, img_bgr) -> str:
         if self._ocr is None or not self.ocr_keywords:
             return ""
@@ -371,6 +381,11 @@ class DisconnectAlert:
                 continue
             blob = " ".join(str(item[1]) for item in result if len(item) >= 2)
             blob_n = self._normalize_ocr_text(blob)
+            # 商城/现金商城等画面里的「重新登录」按钮会误报掉线，先查抑制词。
+            for sk in self._suppress_ocr_keywords():
+                if sk in blob_n:
+                    self._last_score = 1.0
+                    return ""
             for kw in self.ocr_keywords:
                 if not kw:
                     continue

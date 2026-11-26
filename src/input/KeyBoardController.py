@@ -108,7 +108,7 @@ class KeyBoardController:
 
     def __init__(self, cfg):
         self.cfg = cfg
-        # start_idle: wait for F1/F2 before combat
+        # start_idle: wait for F1-F5 before combat
         self.is_enable = not bool((cfg.get("bot") or {}).get("start_idle", True))
         self.is_terminated = False
         self._active_profile = None
@@ -130,6 +130,7 @@ class KeyBoardController:
         self._walk_teleport_next_cd = 0.0  # next Z delay sampled in [cooldown_min, cooldown_max]
         self._chase_active = False  # True only while flashing toward a monster
         self._attack_pause_until = 0.0
+        self._move_pause_until = 0.0     # 攻击后「站桩」截止（技能宏跑完前不走）
         self._face_direction_until = 0.0
         self._hold_up_until = 0.0
         self._t_last_face_tap = 0.0
@@ -168,7 +169,7 @@ class KeyBoardController:
             # Idle until F1/F2: do not cast buffs / move until a profile starts
             self._startup_combat_blocked = False
             self._initial_buff_pending = set()
-            logger.info("[KB] Idle on start — press F1 / F2 / F3 to begin")
+            logger.info("[KB] Idle on start — press F1 / F2 / F3 / F4 / F5 to begin")
         self._action_lock = threading.Lock()
         self._send_lock = threading.Lock()
         self._window_title = ""
@@ -211,7 +212,7 @@ class KeyBoardController:
         # Start daemon thread
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-        state = "ENABLED" if self.is_enable else "IDLE (F1/F2/F3)"
+        state = "ENABLED" if self.is_enable else "IDLE (F1-F5)"
         logger.info(f"[KeyBoardController] Started — {state}")
 
     def set_command(self, cmd_str):
@@ -376,7 +377,7 @@ class KeyBoardController:
         return True
 
     def start_profile(self, profile_id: str):
-        """F1/F2/F3 handler: same profile again toggles off; otherwise switch + enable."""
+        """F1-F5 handler: same profile again toggles off; otherwise switch + enable."""
         now = time.time()
         # Prevent accidental double-tap (game/OS key repeat) from instantly disabling
         if (now - getattr(self, "_t_last_profile_toggle", 0.0)) < getattr(
@@ -411,6 +412,7 @@ class KeyBoardController:
         self._buff_freeze_until = 0.0
         self._alert_freeze_until = 0.0
         self._attack_pause_until = 0.0
+        self._move_pause_until = 0.0
         self._force_walk_until = 0.0
         self._hold_up_until = 0.0
         self._face_direction_until = 0.0
@@ -635,6 +637,7 @@ class KeyBoardController:
             return
         self.cmd_left_right = direction
         self._dir_override_token = int(getattr(self, "_dir_override_token", 0)) + 1
+        self._t_last_dir_override = time.time()
         # Do not re-hold movement while buff is casting or startup buffs pending.
         if getattr(self, "_startup_combat_blocked", False) or time.time() < float(
             getattr(self, "_buff_freeze_until", 0.0)
@@ -708,6 +711,223 @@ class KeyBoardController:
         return ok
 
 
+    def tap_key(self, key: str, duration: float = 0.04) -> bool:
+        """Public one-shot tap for helpers (e.g. ↓+jump drop back to the bottom floor).
+
+        Goes through the same serialized path as attacks/potions so it cannot
+        interleave with a combo press, and it is a no-op while AFK is off.
+        """
+        if not str(key or "").strip():
+            return False
+        return self._press_key_serialized(str(key), duration)
+
+    @staticmethod
+    def _jitter(value: float, jitter: float) -> float:
+        """把固定时长抖成 [v*(1-j), v*(1+j)] 的随机值（j 上限 0.9）。"""
+        try:
+            v = float(value)
+            j = min(0.9, max(0.0, float(jitter)))
+        except (TypeError, ValueError):
+            return float(value or 0.0)
+        if v <= 0.0 or j <= 0.0:
+            return v
+        return random.uniform(v * (1.0 - j), v * (1.0 + j))
+
+    def _press_followup_key(self, aoe_cfg: dict) -> bool:
+        """攻击后接辅助键/连招（F5 是 Z→X：轻羽鞋 + 激退射击，往前窜很远）。
+
+        配置（都放在 aoe_skill 下）：
+          followup_keys     连招键列表，如 ["z", "x"]；也支持单个 followup_key
+          followup_gap      攻击按下后等多久再按第一个键，默认 0.12s
+          followup_step_gap 连招里两个键之间隔多久（"马上"就设 0.05），默认 0.06s
+          followup_press_duration  每个键按多久，默认 0.05s
+          followup_cooldown_s      两次接键的最小间隔，0=不限制
+        """
+        if not isinstance(aoe_cfg, dict):
+            return False
+        raw = aoe_cfg.get("followup_keys")
+        if isinstance(raw, (list, tuple)):
+            keys = [str(k).strip() for k in raw if str(k).strip()]
+        else:
+            single = str(aoe_cfg.get("followup_key", "") or "").strip()
+            keys = [single] if single else []
+        if not keys or not getattr(self, "is_enable", False):
+            return False
+        now = time.time()
+        cd = float(aoe_cfg.get("followup_cooldown_s", 0.0) or 0.0)
+        if cd > 0 and (now - float(getattr(self, "_t_last_followup", 0.0) or 0.0)) < cd:
+            return False
+        jit = float(aoe_cfg.get("timing_jitter", 0.0) or 0.0)
+        # 连招「内部」的间隔（Z→X、X→转回）单独一个很小的抖动：
+        # 这两步要连贯，抖大了连招就断了。
+        cjit = float(aoe_cfg.get("combo_step_jitter", 0.0) or 0.0)
+        gap = self._jitter(
+            max(0.0, float(aoe_cfg.get("followup_gap", 0.12) or 0.0)), jit
+        )
+        # 还要等 post_attack_freeze_s 的「站桩」结束：A 是技能宏时，宏没跑完
+        # 按 Z 会被吞，所以等移动解冻之后再按。
+        pause_until = float(getattr(self, "_move_pause_until", 0.0) or 0.0)
+        if pause_until > time.time():
+            gap = max(gap, pause_until - time.time())
+        if gap > 0:
+            time.sleep(gap)
+        # 轻羽鞋/激退射击这类要「朝某方向」的键：按之前把方向键补按住
+        direction = self.cmd_left_right if self.cmd_left_right in ("left", "right") else None
+        if direction:
+            try:
+                key_up("left" if direction == "right" else "right")
+                key_down(direction)
+                self._last_left_right = direction
+                self._t_last_dir_reassert = time.time()
+                # 先真的走起来再放连招：站着放 Z 容易不生效，只剩 X
+                settle_s = max(0.0, float(aoe_cfg.get("followup_settle_s", 0.05) or 0.0))
+                time.sleep(settle_s)
+            except Exception:
+                pass
+        hold = max(0.02, min(1.0, float(aoe_cfg.get("followup_press_duration", 0.05) or 0.05)))
+        step_gap = self._jitter(
+            max(0.0, float(aoe_cfg.get("followup_step_gap", 0.06) or 0.0)), cjit
+        )
+        # ZX 连招：激退射击是「反冲」——要朝后放才会把人往前推，所以连招是
+        #   Z(轻羽鞋) → 转身 → X(激退射击) → 转回来
+        turn_between = (
+            bool(aoe_cfg.get("followup_turn_between", False))
+            and direction is not None
+            and len(keys) >= 2
+        )
+        tap_s = max(0.02, min(0.30, float(aoe_cfg.get("followup_turn_tap_s", 0.05) or 0.05)))
+        # X 之后的「转回来」要等 X 的反冲动作放完，否则面向先翻回来，
+        # 激退射击就白放了（症状：看到人先回头，X 根本没出来）。
+        turn_back_delay = self._jitter(
+            max(0.0, float(aoe_cfg.get("followup_turn_back_delay_s", 0.30) or 0.0)), cjit
+        )
+        opposite = ("left" if direction == "right" else "right") if direction else None
+        ok = False
+        marks = {}
+        t_combo = time.time()
+        for i, key in enumerate(keys):
+            if i > 0 and step_gap > 0:
+                time.sleep(step_gap)
+            if not getattr(self, "is_enable", False):
+                break
+            if turn_between and i == 1:
+                # X 之前转身：先松掉方向键，点一下反方向把面向翻过去
+                try:
+                    key_up("left")
+                    key_up("right")
+                except Exception:
+                    pass
+                self._last_left_right = "none"
+                try:
+                    self._tap_direction(opposite, tap_s)
+                except Exception:
+                    pass
+                marks["turn"] = time.time() - t_combo
+            elif direction and i > 0:
+                # 连招中间要保持方向键按住（_press_key_serialized 会松掉）
+                try:
+                    key_down(direction)
+                    self._last_left_right = direction
+                except Exception:
+                    pass
+            one = self._press_key_serialized(key, hold)
+            marks[key] = time.time() - t_combo
+            ok = ok or one
+            # 起手键（Z）没按出去就不要接着放 X：否则会出现「单放一个 X」
+            if i == 0 and bool(aoe_cfg.get("followup_skip_on_fail", True)) and not one:
+                logger.info(
+                    f"[Combo] 起手键 '{key}' 没按出去 → 跳过后面的 "
+                    f"{'→'.join(keys[1:])}，避免单放"
+                )
+                marks["skip"] = time.time() - t_combo
+                break
+        if turn_between:
+            # X 放完、等反冲动作走完再转回来（之前是 step_gap，太早）
+            try:
+                if turn_back_delay > 0:
+                    time.sleep(turn_back_delay)
+                self._tap_direction(direction, tap_s)
+                key_down(direction)
+                self._last_left_right = direction
+                self._t_last_dir_reassert = time.time()
+                marks["turn_back"] = time.time() - t_combo
+            except Exception:
+                pass
+        if bool(aoe_cfg.get("combo_debug", False)):
+            logger.info(
+                "[Combo] " + " ".join(f"{k}@{v:.2f}" for k, v in marks.items())
+            )
+        if ok:
+            self._t_last_followup = time.time()
+        return ok
+
+    def teleport_in_dir(self, key: str, duration: float = 0.12,
+                        direction: str = None) -> bool:
+        """朝指定方向瞬移一次（法师瞬移必须按住方向键才生效）。
+
+        direction 由调用方（探测器）传当前巡逻方向——因为它知道 `_hunt_search_dir`，
+        而 `cmd_left_right` 在"小段停顿"（move_x=none）时是 none，这时候
+        只按 X 是不会飞的（这正是日志里按了十几次瞬移却不动的原因之一）。
+        调用时先补按方向键、等 settle 再按瞬移，最后保持方向键按住。
+        """
+        tp_key = str(key or "").strip()
+        if not tp_key or not getattr(self, "is_enable", False):
+            return False
+        dirn = direction if direction in ("left", "right") else None
+        if dirn is None:
+            dirn = self.cmd_left_right if self.cmd_left_right in ("left", "right") else None
+        direction = dirn
+        with self._send_lock:
+            self._ensure_game_focus(force=False)
+            if direction:
+                try:
+                    key_up("left" if direction == "right" else "right")
+                    key_down(direction)
+                    self._last_left_right = direction
+                    self._t_last_dir_reassert = time.time()
+                    # 先让转身/朝向生效再按瞬移，太急会朝旧方向飞或者不生效
+                    settle = float(
+                        (self.cfg.get("directional_attack") or {}).get(
+                            "flip_teleport_settle_s", 0.06
+                        )
+                        or 0.0
+                    )
+                    time.sleep(max(0.0, settle))
+                except Exception:
+                    pass
+            ok = press_key(tp_key, max(0.05, float(duration)))
+        return ok
+
+    def drop_through_platform(self, jump_key: str, hold_s: float = 0.07,
+                              jump_s: float = 0.05) -> bool:
+        """↓+跳 穿平台：短暂按住 ↓ 再点跳，然后马上松开 ↓。
+
+        不能长期把 ↓ 挂在 move_y 上——冒险岛里按住 ↓ 人物是蹲着的，根本不会走，
+        巡逻就永远到不了地图左右边缘（F4 首次实测就是这样卡住不换向的）。
+        """
+        key = str(jump_key or "").strip()
+        if not key or not getattr(self, "is_enable", False):
+            return False
+        with self._send_lock:
+            self._ensure_game_focus(force=False)
+            if not key_down("down"):
+                return False
+            try:
+                time.sleep(max(0.02, float(hold_s)))
+                press_key(key, max(0.02, float(jump_s)))
+            finally:
+                try:
+                    key_up("down")
+                except Exception:
+                    pass
+        self._last_up_down = "none"
+        self._invalidate_held_dirs()
+        return True
+
+    def set_reload_callback(self, cb) -> None:
+        """F12：重新加载配置的回调（由 main 注册）。"""
+        self._reload_config_cb = cb
+
     def _refresh_window_title(self) -> str:
         """Re-resolve game HWND title (skip Cursor/B站 etc.)."""
         token = str((self.cfg.get("game_window") or {}).get("title", "") or "")
@@ -721,16 +941,19 @@ class KeyBoardController:
         return self._window_title or token
 
     def _poll_profile_hotkeys(self):
-        """Fallback F1/F2/F3 via GetAsyncKeyState when game eats pynput events."""
+        """Fallback F1–F5 via GetAsyncKeyState when game eats pynput events."""
         if not is_windows():
             return
         try:
             import ctypes
             user32 = ctypes.windll.user32
-            # VK_F1=0x70, VK_F2=0x71, VK_F3=0x72; high bit set => currently down
+            # VK_F1=0x70 .. VK_F5=0x74; high bit set => currently down
             f1_down = bool(user32.GetAsyncKeyState(0x70) & 0x8000)
             f2_down = bool(user32.GetAsyncKeyState(0x71) & 0x8000)
             f3_down = bool(user32.GetAsyncKeyState(0x72) & 0x8000)
+            f4_down = bool(user32.GetAsyncKeyState(0x73) & 0x8000)
+            f5_down = bool(user32.GetAsyncKeyState(0x74) & 0x8000)
+            f12_down = bool(user32.GetAsyncKeyState(0x7B) & 0x8000)  # VK_F12
         except Exception:
             return
         # First sample only primes state — a key already held at boot must not
@@ -739,14 +962,31 @@ class KeyBoardController:
             self._poll_f1_down = f1_down
             self._poll_f2_down = f2_down
             self._poll_f3_down = f3_down
+            self._poll_f4_down = f4_down
+            self._poll_f5_down = f5_down
+            self._poll_f12_down = f12_down
             self._poll_profile_primed = True
             return
         prev1 = bool(getattr(self, "_poll_f1_down", False))
         prev2 = bool(getattr(self, "_poll_f2_down", False))
         prev3 = bool(getattr(self, "_poll_f3_down", False))
+        prev4 = bool(getattr(self, "_poll_f4_down", False))
+        prev5 = bool(getattr(self, "_poll_f5_down", False))
+        prev12 = bool(getattr(self, "_poll_f12_down", False))
         self._poll_f1_down = f1_down
         self._poll_f2_down = f2_down
         self._poll_f3_down = f3_down
+        self._poll_f4_down = f4_down
+        self._poll_f5_down = f5_down
+        self._poll_f12_down = f12_down
+        # F12 = 重新加载配置（pynput 常被游戏吞掉，这里也轮询一份）
+        if f12_down and not prev12:
+            cb = getattr(self, "_reload_config_cb", None)
+            if cb is not None:
+                try:
+                    cb()
+                except Exception:
+                    pass
         # Rising edge only
         if f1_down and not prev1:
             try:
@@ -762,6 +1002,18 @@ class KeyBoardController:
             try:
                 if (self.cfg.get("profiles") or {}).get("f3"):
                     self.start_profile("f3")
+            except Exception:
+                pass
+        if f4_down and not prev4:
+            try:
+                if (self.cfg.get("profiles") or {}).get("f4"):
+                    self.start_profile("f4")
+            except Exception:
+                pass
+        if f5_down and not prev5:
+            try:
+                if (self.cfg.get("profiles") or {}).get("f5"):
+                    self.start_profile("f5")
             except Exception:
                 pass
 
@@ -806,6 +1058,11 @@ class KeyBoardController:
         elif right_down and not prev_r and cur == "left":
             want = "right"
         if want is None:
+            return
+        # Our own auto-flip also presses the opposite arrow. Counting that as a
+        # user tap re-flipped the patrol and bypassed the flip cooldown, so F4
+        # thrashed right/left every second and never walked to an edge.
+        if now - float(getattr(self, "_t_last_dir_override", 0.0) or 0.0) < 1.0:
             return
         self._t_last_manual_flip = now
         self.force_patrol_dir(want, reason="manual_key")
@@ -1033,6 +1290,13 @@ class KeyBoardController:
                 _pynput_kb.release(getattr(Key, self._last_up_down, self._last_up_down))
             self._last_left_right = "none"
             self._last_up_down = "none"
+            return
+
+        # 攻击后的站桩（aoe_skill.post_attack_freeze_s）：技能宏还在跑，先别走。
+        if time.time() < float(getattr(self, "_move_pause_until", 0.0) or 0.0):
+            if self._last_left_right in ("left", "right"):
+                key_up(self._last_left_right)
+            self._last_left_right = "none"
             return
 
         # Left/Right: support both walking (hold) and face-only taps.
@@ -1297,7 +1561,26 @@ class KeyBoardController:
                                     break
                                 time.sleep(min(0.05, max(0.0, end - time.time())))
                 else:
-                    self._press_key_serialized(atk_key, 0.05)
+                    # 按住技能的时长：治愈术这类持续施法需要按一会儿才出招，
+                    # 50ms 的轻点经常被吞。默认 0.05 保持老行为，F4 配 0.8。
+                    hold = float(aoe_cfg.get("press_duration", 0.05) or 0.05)
+                    self._press_key_serialized(atk_key, max(0.02, min(2.0, hold)))
+                    # 技能宏/长动作：按完先站住，别让方向键打断（F5 的 A 是宏）。
+                    # timing_jitter 让站桩/连招的间隔带点随机，别太规律。
+                    jit = float(aoe_cfg.get("timing_jitter", 0.0) or 0.0)
+                    freeze_s = self._jitter(
+                        float(aoe_cfg.get("post_attack_freeze_s", 0.0) or 0.0), jit
+                    )
+                    if freeze_s > 0:
+                        self._move_pause_until = time.time() + freeze_s
+                        try:
+                            key_up("left")
+                            key_up("right")
+                        except Exception:
+                            pass
+                        self._last_left_right = "none"
+                    # 攻击后接一下辅助键（F5 的 Z=轻羽鞋）：会等站桩结束再按。
+                    self._press_followup_key(aoe_cfg)
                 self._t_last_attack = t_now
                 # Resample next attack delay in [cooldown_min, cooldown_max]
                 if self.cmd_action == "aoe" or self.attack_mode == "aoe_skill":

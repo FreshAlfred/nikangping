@@ -115,6 +115,12 @@ class LieAlert:
         self.exclude_top_ratio = float(la.get("exclude_top_ratio", 0.08))
         self.mouse_smooth = float(la.get("mouse_smooth", 0.55))
         self.mouse_takeover_px = float(la.get("mouse_takeover_px", 30.0))
+        # 测谎小游戏要「移到形状上并点击」：只悬停不算完成。
+        self.follow_click = bool(la.get("follow_click", True))
+        self.follow_click_interval_s = float(la.get("follow_click_interval_s", 0.45))
+        self._our_click_t = 0.0
+        self._last_click_t = 0.0
+        self._click_log_t = 0.0
         # Short settle only; never use this to ignore a large user yank.
         self.mouse_move_grace_s = float(la.get("mouse_move_grace_s", 0.08))
         self.lose_target_grace_s = float(la.get("lose_target_grace_s", 1.2))
@@ -464,6 +470,13 @@ class LieAlert:
         self.mouse_smooth = float(la.get("mouse_smooth", self.mouse_smooth))
         self.mouse_takeover_px = float(
             la.get("mouse_takeover_px", self.mouse_takeover_px)
+        )
+        self.follow_click = bool(la.get("follow_click", getattr(self, "follow_click", True)))
+        self.follow_click_interval_s = float(
+            la.get(
+                "follow_click_interval_s",
+                getattr(self, "follow_click_interval_s", 0.45),
+            )
         )
         self.mouse_move_grace_s = float(
             la.get("mouse_move_grace_s", getattr(self, "mouse_move_grace_s", 0.08))
@@ -1162,15 +1175,16 @@ class LieAlert:
             return max(0.015, min(0.055, thr))
         base = os.path.basename(path).lower()
         # Intro instruction panel (「3秒后…」): very tight — sky/cloud false
-        # matches sit around 0.04–0.08 on this client.
+        # matches sit around 0.04–0.08 on this client. 0.025 太松：商城界面和
+        # 云层都能到 0.026 触发假警报，降到 0.008（真说明窗是静态白窗，≈0.00x）。
         if "intro_body" in base or "intro_banner" in base:
             base_thr = float(
                 (self.cfg.get("lie_alert") or {}).get(
-                    "intro_match_threshold", 0.025
+                    "intro_match_threshold", 0.008
                 )
             )
             thr = base_thr * scale
-            return max(0.012, min(0.040, thr))
+            return max(0.004, min(0.040, thr))
         thr = float(self.match_threshold) * scale
         return max(0.06, min(0.22, thr))
 
@@ -1230,6 +1244,20 @@ class LieAlert:
             + (", auto-follow shape" if self.auto_follow else ", answer manually")
         )
         self._play_loud_alert()
+        # 存一张“弹窗刚出现”的原始帧，方便事后核对形状到底在屏幕哪里
+        # （录像 mp4 会被压缩，静态图看得更清楚）
+        try:
+            if self.record_clip and img_frame_bgr is not None and getattr(
+                img_frame_bgr, "size", 0
+            ):
+                snap_dir = str(getattr(self, "record_dir", "_debug_out/lie_clips"))
+                os.makedirs(snap_dir, exist_ok=True)
+                stamp = time.strftime("%Y%m%d-%H%M%S")
+                snap_path = os.path.join(snap_dir, f"lie_first_{stamp}.png")
+                cv2.imwrite(snap_path, img_frame_bgr)
+                logger.info(f"[LieAlert] 已保存弹窗首帧 {snap_path}")
+        except Exception as _snap_e:
+            logger.debug(f"[LieAlert] snapshot failed: {_snap_e}")
         self._track_xy = None
         self._track_vel = (0.0, 0.0)
         self._mouse_xy = None
@@ -1410,6 +1438,16 @@ class LieAlert:
     def _normalize_ocr_text(s: str) -> str:
         return "".join(ch for ch in str(s).upper() if not ch.isspace())
 
+    def _suppress_ocr_keywords(self):
+        """OCR 关键词抑制表（商城等非游戏画面），返回已归一化的词。"""
+        raw = (self.cfg.get("lie_alert") or {}).get("suppress_keywords") or []
+        out = []
+        for k in raw:
+            nk = self._normalize_ocr_text(k)
+            if nk:
+                out.append(nk)
+        return out
+
     def _match_ocr(self, img_bgr) -> str:
         """Return matched keyword if OCR finds it; try center + dialog band."""
         if self._ocr is None or not self.ocr_keywords:
@@ -1449,6 +1487,12 @@ class LieAlert:
                 continue
             blob = " ".join(str(item[1]) for item in result if len(item) >= 2)
             blob_n = self._normalize_ocr_text(blob)
+            # 商城/现金商城这类画面：整屏文字会误命中「测谎仪」「重新登录」等
+            # 关键词，先查抑制词；命中就把这一帧当成没认到。
+            for sk in self._suppress_ocr_keywords():
+                if sk in blob_n:
+                    self._last_score = 1.0
+                    return ""
             for kw in self.ocr_keywords:
                 if not kw:
                     continue
@@ -1859,6 +1903,18 @@ class LieAlert:
             self.following = True
             self._hold_until = max(float(self._hold_until), now + 8.0)
             self._move_mouse_to_frame_point(move_pt, capture)
+            # 移到形状上还得点一下：只悬停不算抓取（很多服是"点击捕获"）
+            if self.follow_click and not self._mouse_yielded:
+                interval = max(0.15, float(self.follow_click_interval_s))
+                if now - float(self._last_click_t or 0.0) >= interval:
+                    if self._click_here():
+                        self._last_click_t = now
+                        if now - float(self._click_log_t or 0.0) > 2.0:
+                            self._click_log_t = now
+                            logger.info(
+                                f"[LieAlert] click {move_src} @ "
+                                f"frame=({move_pt[0]:.0f},{move_pt[1]:.0f})"
+                            )
             if now - self._follow_log_t > 1.0:
                 self._follow_log_t = now
                 logger.info(
@@ -4502,7 +4558,12 @@ class LieAlert:
         if self._mouse_yielded:
             return
         # After first snap: any click = player intervene → stop fighting.
-        if self._mouse_placed_xy is not None and self._mouse_button_down():
+        # 但别把「我们自己刚发的点击」当成用户接管。
+        if (
+            self._mouse_placed_xy is not None
+            and self._mouse_button_down()
+            and (time.time() - float(getattr(self, "_our_click_t", 0.0) or 0.0)) > 0.25
+        ):
             self._yield_to_user(
                 "user mouse button — stop auto-follow (player intervene)"
             )
@@ -4577,6 +4638,50 @@ class LieAlert:
             left = int(region.get("left", 0) or 0)
             top = int(region.get("top", 0) or 0)
         return int(left + fx), int(top + title_bar + fy)
+
+    def _click_here(self) -> bool:
+        """在当前光标位置点一下左键。
+
+        谎言探测仪的判定是「把鼠标移到形状上并点击」——只悬停不算完成，
+        之前一直失败就是因为只移动不点击。
+        """
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            ULONG_PTR = (
+                ctypes.c_uint64 if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
+            )
+
+            class MOUSEINPUT(ctypes.Structure):
+                _fields_ = [
+                    ("dx", wintypes.LONG),
+                    ("dy", wintypes.LONG),
+                    ("mouseData", wintypes.DWORD),
+                    ("dwFlags", wintypes.DWORD),
+                    ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ULONG_PTR),
+                ]
+
+            class INPUT_I(ctypes.Union):
+                _fields_ = [("mi", MOUSEINPUT)]
+
+            class INPUT(ctypes.Structure):
+                _fields_ = [("type", wintypes.DWORD), ("ii", INPUT_I)]
+
+            MOUSEEVENTF_LEFTDOWN = 0x0002
+            MOUSEEVENTF_LEFTUP = 0x0004
+            seq = (INPUT * 2)()
+            for i, flag in enumerate((MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP)):
+                seq[i].type = 0
+                seq[i].ii.mi = MOUSEINPUT(0, 0, 0, flag, 0, ULONG_PTR(0))
+            self._our_click_t = time.time()
+            sent = user32.SendInput(2, ctypes.byref(seq), ctypes.sizeof(INPUT))
+            return bool(sent)
+        except Exception as e:
+            logger.debug(f"[LieAlert] click failed: {e}")
+            return False
 
     def _set_cursor_screen(self, ix: int, iy: int) -> bool:
         """Move OS cursor; SetCursorPos + absolute SendInput (virtual desktop)."""
@@ -4663,7 +4768,12 @@ class LieAlert:
         if self._mouse_yielded:
             return
         # Last chance: if player already yanked/clicked, do not fight this frame.
-        if self._mouse_placed_xy is not None and self._mouse_button_down():
+        # 我们自己刚发的点击不算用户接管（否则一按就 yield）。
+        if (
+            self._mouse_placed_xy is not None
+            and self._mouse_button_down()
+            and (time.time() - float(getattr(self, "_our_click_t", 0.0) or 0.0)) > 0.25
+        ):
             self._yield_to_user(
                 "user mouse button — stop auto-follow (player intervene)"
             )
